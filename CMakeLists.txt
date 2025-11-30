@@ -6,7 +6,8 @@ set(TARGET_NAME http_request)
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
 # used in cmake with find_package.
 find_package(OpenSSL REQUIRED)
-find_package(CURL REQUIRED)
+# CURL is a transitive dependency via vcpkg for httpfs - don't require it directly as tidy-check doesn't use vcpkg
+find_package(CURL QUIET)
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
