@@ -4,7 +4,7 @@
 
 namespace duckdb {
 
-class HttputilRequestExtension : public Extension {
+class HttpRequestExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override;
 	std::string Name() override;

@@ -1,8 +1,9 @@
 #define DUCKDB_EXTENSION_MAIN
 
-#include "httputil_request_extension.hpp"
+#include "http_request_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/gzip_file_system.hpp"
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -10,7 +11,9 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_file_opener.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 
 // Use httplib directly for full HTTP method support
 #define CPPHTTPLIB_OPENSSL_SUPPORT
@@ -152,6 +155,36 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
                                    int32_t &status_code, vector<Value> &header_keys, vector<Value> &header_values,
                                    string &final_body) {
 	auto &db = DatabaseInstance::GetDatabase(context);
+	auto &config = db.config;
+
+	// Read HTTP settings from extension options (httpfs settings)
+	uint64_t http_timeout = 30;
+	uint64_t http_retries = 3;
+	bool http_keep_alive = true;
+
+	// Create file opener to read settings
+	ClientContextFileOpener opener(context);
+	FileOpenerInfo info;
+	info.file_path = url;
+
+	// Try to read httpfs extension settings
+	FileOpener::TryGetCurrentSetting(&opener, "http_timeout", http_timeout, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_retries", http_retries, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_keep_alive", http_keep_alive, &info);
+
+	// Read proxy settings - first from secrets, then fall back to core settings
+	string http_proxy = config.options.http_proxy;
+	string http_proxy_username = config.options.http_proxy_username;
+	string http_proxy_password = config.options.http_proxy_password;
+
+	// Try reading proxy from secrets (httpfs style)
+	KeyValueSecretReader secret_reader(opener, &info, "http");
+	string proxy_from_secret;
+	if (secret_reader.TryGetSecretKey<string>("http_proxy", proxy_from_secret) && !proxy_from_secret.empty()) {
+		http_proxy = proxy_from_secret;
+	}
+	secret_reader.TryGetSecretKey<string>("http_proxy_username", http_proxy_username);
+	secret_reader.TryGetSecretKey<string>("http_proxy_password", http_proxy_password);
 
 	// Parse URL
 	string proto_host_port, path;
@@ -162,6 +195,25 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 	client.set_follow_location(true);
 	client.set_decompress(false); // We handle decompression ourselves
 	client.enable_server_certificate_verification(false);
+
+	// Apply timeout settings
+	auto timeout_sec = static_cast<time_t>(http_timeout);
+	client.set_read_timeout(timeout_sec, 0);
+	client.set_write_timeout(timeout_sec, 0);
+	client.set_connection_timeout(timeout_sec, 0);
+	client.set_keep_alive(http_keep_alive);
+
+	// Configure proxy
+	if (!http_proxy.empty()) {
+		string proxy_host;
+		idx_t proxy_port = 80;
+		HTTPUtil::ParseHTTPProxyHost(http_proxy, proxy_host, proxy_port);
+		client.set_proxy(proxy_host, static_cast<int>(proxy_port));
+
+		if (!http_proxy_username.empty()) {
+			client.set_proxy_basic_auth(http_proxy_username, http_proxy_password);
+		}
+	}
 
 	// Build headers
 	duckdb_httplib_openssl::Headers headers;
@@ -296,6 +348,53 @@ static void ByteRangeFunction(DataChunk &args, ExpressionState &state, Vector &r
 		    string range_str = "bytes=" + std::to_string(offset) + "-" + std::to_string(end);
 		    return StringVector::AddString(result, range_str);
 	    });
+}
+
+// http_range_header(offset, length) -> STRUCT with Range header for use as headers parameter
+static void HttpRangeHeaderFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &offset_vec = args.data[0];
+	auto &length_vec = args.data[1];
+	auto count = args.size();
+
+	for (idx_t i = 0; i < count; i++) {
+		auto offset = offset_vec.GetValue(i).GetValue<int64_t>();
+		auto length = length_vec.GetValue(i).GetValue<int64_t>();
+		int64_t end = offset + length - 1;
+		string range_str = "bytes=" + std::to_string(offset) + "-" + std::to_string(end);
+
+		child_list_t<Value> struct_values;
+		struct_values.push_back(make_pair("Range", Value(range_str)));
+		result.SetValue(i, Value::STRUCT(std::move(struct_values)));
+	}
+}
+
+// Bind function for http_range_header - handles named parameter reordering
+static unique_ptr<FunctionData> HttpRangeHeaderBind(ClientContext &context, ScalarFunction &bound_function,
+                                                    vector<unique_ptr<Expression>> &arguments) {
+	if (arguments.size() == 2) {
+		idx_t offset_idx = 0;
+		idx_t length_idx = 1;
+
+		for (idx_t i = 0; i < arguments.size(); i++) {
+			if (StringUtil::CIEquals(arguments[i]->alias, "offset")) {
+				offset_idx = i;
+			} else if (StringUtil::CIEquals(arguments[i]->alias, "length")) {
+				length_idx = i;
+			}
+		}
+
+		if (offset_idx == 1 && length_idx == 0) {
+			std::swap(arguments[0], arguments[1]);
+		}
+	}
+	return nullptr;
+}
+
+// Return type for http_range_header function
+static LogicalType CreateHttpRangeHeaderType() {
+	child_list_t<LogicalType> struct_children;
+	struct_children.push_back(make_pair("Range", LogicalType::VARCHAR));
+	return LogicalType::STRUCT(std::move(struct_children));
 }
 
 //------------------------------------------------------------------------------
@@ -497,66 +596,127 @@ static void HttpDeleteScalar2(DataChunk &args, ExpressionState &state, Vector &r
 	}
 }
 
+// http_delete(url, headers, params)
+static void HttpDeleteScalar3(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &url_vec = args.data[0];
+	auto &headers_vec = args.data[1];
+	auto &params_vec = args.data[2];
+	auto count = args.size();
+	auto &context = state.GetContext();
+
+	for (idx_t i = 0; i < count; i++) {
+		auto base_url = url_vec.GetValue(i).GetValue<string>();
+		auto headers = headers_vec.GetValue(i);
+		auto params = params_vec.GetValue(i);
+		auto url = BuildUrlWithParams(base_url, params);
+		int32_t status_code;
+		vector<Value> header_keys, header_values;
+		string body;
+		PerformHttpRequestCore(context, url, "DELETE", headers, status_code, header_keys, header_values, body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, body));
+	}
+}
+
+// Bind function for http_delete(url, headers, params) - reorders arguments based on aliases
+static unique_ptr<FunctionData> HttpDeleteScalar3Bind(ClientContext &context, ScalarFunction &bound_function,
+                                                      vector<unique_ptr<Expression>> &arguments) {
+	if (arguments.size() == 3) {
+		idx_t headers_idx = 1;
+		idx_t params_idx = 2;
+
+		for (idx_t i = 1; i < arguments.size(); i++) {
+			if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
+				headers_idx = i;
+			} else if (StringUtil::CIEquals(arguments[i]->alias, "params")) {
+				params_idx = i;
+			}
+		}
+
+		if (headers_idx == 2 && params_idx == 1) {
+			std::swap(arguments[1], arguments[2]);
+		}
+	}
+	return nullptr;
+}
+
 //------------------------------------------------------------------------------
 // http_post scalar functions
 //------------------------------------------------------------------------------
 
-// http_post(url, body)
-static void HttpPostScalar2(DataChunk &args, ExpressionState &state, Vector &result) {
+// http_post(url)
+static void HttpPostScalar1(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &url_vec = args.data[0];
-	auto &body_vec = args.data[1];
 	auto count = args.size();
 	auto &context = state.GetContext();
 
 	for (idx_t i = 0; i < count; i++) {
 		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto request_body = body_vec.GetValue(i).GetValueUnsafe<string>();
 		int32_t status_code;
 		vector<Value> header_keys, header_values;
 		string response_body;
-		PerformHttpRequestCore(context, url, "POST", Value(), request_body, "application/octet-stream", status_code,
-		                       header_keys, header_values, response_body);
+		PerformHttpRequestCore(context, url, "POST", Value(), "", "application/octet-stream", status_code, header_keys,
+		                       header_values, response_body);
 		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
 	}
 }
 
-// http_post(url, body, headers)
-static void HttpPostScalar3(DataChunk &args, ExpressionState &state, Vector &result) {
+// http_post(url, headers)
+static void HttpPostScalar2(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &url_vec = args.data[0];
-	auto &body_vec = args.data[1];
-	auto &headers_vec = args.data[2];
+	auto &headers_vec = args.data[1];
 	auto count = args.size();
 	auto &context = state.GetContext();
 
 	for (idx_t i = 0; i < count; i++) {
 		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto request_body = body_vec.GetValue(i).GetValueUnsafe<string>();
 		auto headers = headers_vec.GetValue(i);
 		int32_t status_code;
 		vector<Value> header_keys, header_values;
 		string response_body;
-		PerformHttpRequestCore(context, url, "POST", headers, request_body, "", status_code, header_keys, header_values,
+		PerformHttpRequestCore(context, url, "POST", headers, "", "", status_code, header_keys, header_values,
 		                       response_body);
 		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
 	}
 }
 
-// Bind function for http_post(url, body, headers) - allows body/headers reordering
+// http_post(url, headers, params)
+static void HttpPostScalar3(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &url_vec = args.data[0];
+	auto &headers_vec = args.data[1];
+	auto &params_vec = args.data[2];
+	auto count = args.size();
+	auto &context = state.GetContext();
+
+	for (idx_t i = 0; i < count; i++) {
+		auto base_url = url_vec.GetValue(i).GetValue<string>();
+		auto headers = headers_vec.GetValue(i);
+		auto params = params_vec.GetValue(i);
+		auto url = BuildUrlWithParams(base_url, params);
+		int32_t status_code;
+		vector<Value> header_keys, header_values;
+		string response_body;
+		PerformHttpRequestCore(context, url, "POST", headers, "", "", status_code, header_keys, header_values,
+		                       response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+	}
+}
+
+// Bind function for http_post(url, headers, params) - reorders arguments based on aliases
 static unique_ptr<FunctionData> HttpPostScalar3Bind(ClientContext &context, ScalarFunction &bound_function,
                                                     vector<unique_ptr<Expression>> &arguments) {
 	if (arguments.size() == 3) {
-		idx_t body_idx = 1;
-		idx_t headers_idx = 2;
+		idx_t headers_idx = 1;
+		idx_t params_idx = 2;
 
 		for (idx_t i = 1; i < arguments.size(); i++) {
-			if (StringUtil::CIEquals(arguments[i]->alias, "body")) {
-				body_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
+			if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
 				headers_idx = i;
+			} else if (StringUtil::CIEquals(arguments[i]->alias, "params")) {
+				params_idx = i;
 			}
 		}
 
-		if (body_idx == 2 && headers_idx == 1) {
+		if (headers_idx == 2 && params_idx == 1) {
 			std::swap(arguments[1], arguments[2]);
 		}
 	}
@@ -567,62 +727,80 @@ static unique_ptr<FunctionData> HttpPostScalar3Bind(ClientContext &context, Scal
 // http_put scalar functions
 //------------------------------------------------------------------------------
 
-// http_put(url, body)
-static void HttpPutScalar2(DataChunk &args, ExpressionState &state, Vector &result) {
+// http_put(url)
+static void HttpPutScalar1(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &url_vec = args.data[0];
-	auto &body_vec = args.data[1];
 	auto count = args.size();
 	auto &context = state.GetContext();
 
 	for (idx_t i = 0; i < count; i++) {
 		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto request_body = body_vec.GetValue(i).GetValueUnsafe<string>();
 		int32_t status_code;
 		vector<Value> header_keys, header_values;
 		string response_body;
-		PerformHttpRequestCore(context, url, "PUT", Value(), request_body, "application/octet-stream", status_code,
-		                       header_keys, header_values, response_body);
+		PerformHttpRequestCore(context, url, "PUT", Value(), "", "application/octet-stream", status_code, header_keys,
+		                       header_values, response_body);
 		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
 	}
 }
 
-// http_put(url, body, headers)
-static void HttpPutScalar3(DataChunk &args, ExpressionState &state, Vector &result) {
+// http_put(url, headers)
+static void HttpPutScalar2(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &url_vec = args.data[0];
-	auto &body_vec = args.data[1];
-	auto &headers_vec = args.data[2];
+	auto &headers_vec = args.data[1];
 	auto count = args.size();
 	auto &context = state.GetContext();
 
 	for (idx_t i = 0; i < count; i++) {
 		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto request_body = body_vec.GetValue(i).GetValueUnsafe<string>();
 		auto headers = headers_vec.GetValue(i);
 		int32_t status_code;
 		vector<Value> header_keys, header_values;
 		string response_body;
-		PerformHttpRequestCore(context, url, "PUT", headers, request_body, "", status_code, header_keys, header_values,
+		PerformHttpRequestCore(context, url, "PUT", headers, "", "", status_code, header_keys, header_values,
 		                       response_body);
 		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
 	}
 }
 
-// Bind function for http_put(url, body, headers) - allows body/headers reordering
+// http_put(url, headers, params)
+static void HttpPutScalar3(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &url_vec = args.data[0];
+	auto &headers_vec = args.data[1];
+	auto &params_vec = args.data[2];
+	auto count = args.size();
+	auto &context = state.GetContext();
+
+	for (idx_t i = 0; i < count; i++) {
+		auto base_url = url_vec.GetValue(i).GetValue<string>();
+		auto headers = headers_vec.GetValue(i);
+		auto params = params_vec.GetValue(i);
+		auto url = BuildUrlWithParams(base_url, params);
+		int32_t status_code;
+		vector<Value> header_keys, header_values;
+		string response_body;
+		PerformHttpRequestCore(context, url, "PUT", headers, "", "", status_code, header_keys, header_values,
+		                       response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+	}
+}
+
+// Bind function for http_put(url, headers, params) - reorders arguments based on aliases
 static unique_ptr<FunctionData> HttpPutScalar3Bind(ClientContext &context, ScalarFunction &bound_function,
                                                    vector<unique_ptr<Expression>> &arguments) {
 	if (arguments.size() == 3) {
-		idx_t body_idx = 1;
-		idx_t headers_idx = 2;
+		idx_t headers_idx = 1;
+		idx_t params_idx = 2;
 
 		for (idx_t i = 1; i < arguments.size(); i++) {
-			if (StringUtil::CIEquals(arguments[i]->alias, "body")) {
-				body_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
+			if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
 				headers_idx = i;
+			} else if (StringUtil::CIEquals(arguments[i]->alias, "params")) {
+				params_idx = i;
 			}
 		}
 
-		if (body_idx == 2 && headers_idx == 1) {
+		if (headers_idx == 2 && params_idx == 1) {
 			std::swap(arguments[1], arguments[2]);
 		}
 	}
@@ -633,62 +811,80 @@ static unique_ptr<FunctionData> HttpPutScalar3Bind(ClientContext &context, Scala
 // http_patch scalar functions
 //------------------------------------------------------------------------------
 
-// http_patch(url, body)
-static void HttpPatchScalar2(DataChunk &args, ExpressionState &state, Vector &result) {
+// http_patch(url)
+static void HttpPatchScalar1(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &url_vec = args.data[0];
-	auto &body_vec = args.data[1];
 	auto count = args.size();
 	auto &context = state.GetContext();
 
 	for (idx_t i = 0; i < count; i++) {
 		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto request_body = body_vec.GetValue(i).GetValueUnsafe<string>();
 		int32_t status_code;
 		vector<Value> header_keys, header_values;
 		string response_body;
-		PerformHttpRequestCore(context, url, "PATCH", Value(), request_body, "application/octet-stream", status_code,
-		                       header_keys, header_values, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
-	}
-}
-
-// http_patch(url, body, headers)
-static void HttpPatchScalar3(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &url_vec = args.data[0];
-	auto &body_vec = args.data[1];
-	auto &headers_vec = args.data[2];
-	auto count = args.size();
-	auto &context = state.GetContext();
-
-	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto request_body = body_vec.GetValue(i).GetValueUnsafe<string>();
-		auto headers = headers_vec.GetValue(i);
-		int32_t status_code;
-		vector<Value> header_keys, header_values;
-		string response_body;
-		PerformHttpRequestCore(context, url, "PATCH", headers, request_body, "", status_code, header_keys,
+		PerformHttpRequestCore(context, url, "PATCH", Value(), "", "application/octet-stream", status_code, header_keys,
 		                       header_values, response_body);
 		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
 	}
 }
 
-// Bind function for http_patch(url, body, headers) - allows body/headers reordering
+// http_patch(url, headers)
+static void HttpPatchScalar2(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &url_vec = args.data[0];
+	auto &headers_vec = args.data[1];
+	auto count = args.size();
+	auto &context = state.GetContext();
+
+	for (idx_t i = 0; i < count; i++) {
+		auto url = url_vec.GetValue(i).GetValue<string>();
+		auto headers = headers_vec.GetValue(i);
+		int32_t status_code;
+		vector<Value> header_keys, header_values;
+		string response_body;
+		PerformHttpRequestCore(context, url, "PATCH", headers, "", "", status_code, header_keys, header_values,
+		                       response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+	}
+}
+
+// http_patch(url, headers, params)
+static void HttpPatchScalar3(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &url_vec = args.data[0];
+	auto &headers_vec = args.data[1];
+	auto &params_vec = args.data[2];
+	auto count = args.size();
+	auto &context = state.GetContext();
+
+	for (idx_t i = 0; i < count; i++) {
+		auto base_url = url_vec.GetValue(i).GetValue<string>();
+		auto headers = headers_vec.GetValue(i);
+		auto params = params_vec.GetValue(i);
+		auto url = BuildUrlWithParams(base_url, params);
+		int32_t status_code;
+		vector<Value> header_keys, header_values;
+		string response_body;
+		PerformHttpRequestCore(context, url, "PATCH", headers, "", "", status_code, header_keys, header_values,
+		                       response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+	}
+}
+
+// Bind function for http_patch(url, headers, params) - reorders arguments based on aliases
 static unique_ptr<FunctionData> HttpPatchScalar3Bind(ClientContext &context, ScalarFunction &bound_function,
                                                      vector<unique_ptr<Expression>> &arguments) {
 	if (arguments.size() == 3) {
-		idx_t body_idx = 1;
-		idx_t headers_idx = 2;
+		idx_t headers_idx = 1;
+		idx_t params_idx = 2;
 
 		for (idx_t i = 1; i < arguments.size(); i++) {
-			if (StringUtil::CIEquals(arguments[i]->alias, "body")) {
-				body_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
+			if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
 				headers_idx = i;
+			} else if (StringUtil::CIEquals(arguments[i]->alias, "params")) {
+				params_idx = i;
 			}
 		}
 
-		if (body_idx == 2 && headers_idx == 1) {
+		if (headers_idx == 2 && params_idx == 1) {
 			std::swap(arguments[1], arguments[2]);
 		}
 	}
@@ -1037,6 +1233,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                               ByteRangeFunction);
 	loader.RegisterFunction(byte_range_func);
 
+	// Register http_range_header(offset, length) helper function - returns STRUCT for headers parameter
+	auto http_range_header_type = CreateHttpRangeHeaderType();
+	ScalarFunction http_range_header_func("http_range_header", {LogicalType::BIGINT, LogicalType::BIGINT},
+	                                      http_range_header_type, HttpRangeHeaderFunction, HttpRangeHeaderBind);
+	loader.RegisterFunction(http_range_header_func);
+
 	// Register http_head scalar functions
 	ScalarFunctionSet http_head_scalar("http_head");
 	http_head_scalar.AddFunction(ScalarFunction({LogicalType::VARCHAR}, http_response_type, HttpHeadScalar1));
@@ -1076,6 +1278,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	http_delete_scalar.AddFunction(ScalarFunction({LogicalType::VARCHAR}, http_response_type, HttpDeleteScalar1));
 	http_delete_scalar.AddFunction(
 	    ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpDeleteScalar2));
+	ScalarFunction http_delete_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
+	                             HttpDeleteScalar3, HttpDeleteScalar3Bind);
+	http_delete_scalar.AddFunction(http_delete_3);
 	loader.RegisterFunction(http_delete_scalar);
 
 	// Register http_delete table function (with named parameters)
@@ -1087,9 +1292,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register http_post scalar functions
 	ScalarFunctionSet http_post_scalar("http_post");
+	http_post_scalar.AddFunction(ScalarFunction({LogicalType::VARCHAR}, http_response_type, HttpPostScalar1));
 	http_post_scalar.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::BLOB}, http_response_type, HttpPostScalar2));
-	ScalarFunction http_post_3({LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY}, http_response_type,
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPostScalar2));
+	ScalarFunction http_post_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
 	                           HttpPostScalar3, HttpPostScalar3Bind);
 	http_post_scalar.AddFunction(http_post_3);
 	loader.RegisterFunction(http_post_scalar);
@@ -1105,9 +1311,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register http_put scalar functions
 	ScalarFunctionSet http_put_scalar("http_put");
+	http_put_scalar.AddFunction(ScalarFunction({LogicalType::VARCHAR}, http_response_type, HttpPutScalar1));
 	http_put_scalar.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::BLOB}, http_response_type, HttpPutScalar2));
-	ScalarFunction http_put_3({LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY}, http_response_type,
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPutScalar2));
+	ScalarFunction http_put_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
 	                          HttpPutScalar3, HttpPutScalar3Bind);
 	http_put_scalar.AddFunction(http_put_3);
 	loader.RegisterFunction(http_put_scalar);
@@ -1123,9 +1330,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register http_patch scalar functions
 	ScalarFunctionSet http_patch_scalar("http_patch");
+	http_patch_scalar.AddFunction(ScalarFunction({LogicalType::VARCHAR}, http_response_type, HttpPatchScalar1));
 	http_patch_scalar.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::BLOB}, http_response_type, HttpPatchScalar2));
-	ScalarFunction http_patch_3({LogicalType::VARCHAR, LogicalType::BLOB, LogicalType::ANY}, http_response_type,
+	    ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPatchScalar2));
+	ScalarFunction http_patch_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
 	                            HttpPatchScalar3, HttpPatchScalar3Bind);
 	http_patch_scalar.AddFunction(http_patch_3);
 	loader.RegisterFunction(http_patch_scalar);
@@ -1156,17 +1364,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(http_post_form_table);
 }
 
-void HttputilRequestExtension::Load(ExtensionLoader &loader) {
+void HttpRequestExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
 
-std::string HttputilRequestExtension::Name() {
-	return "httputil_request";
+std::string HttpRequestExtension::Name() {
+	return "http_request";
 }
 
-std::string HttputilRequestExtension::Version() const {
-#ifdef EXT_VERSION_HTTPUTIL_REQUEST
-	return EXT_VERSION_HTTPUTIL_REQUEST;
+std::string HttpRequestExtension::Version() const {
+#ifdef EXT_VERSION_HTTP_REQUEST
+	return EXT_VERSION_HTTP_REQUEST;
 #else
 	return "";
 #endif
@@ -1176,7 +1384,7 @@ std::string HttputilRequestExtension::Version() const {
 
 extern "C" {
 
-DUCKDB_CPP_EXTENSION_ENTRY(httputil_request, loader) {
+DUCKDB_CPP_EXTENSION_ENTRY(http_request, loader) {
 	duckdb::LoadInternal(loader);
 }
 }

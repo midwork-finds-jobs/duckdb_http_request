@@ -1,5 +1,5 @@
-# name: test/sql/httputil_request.test
-# description: test httputil_request extension
+# name: test/sql/http_request.test
+# description: test http_request extension
 # group: [sql]
 
 # Before we load the extension, this will fail
@@ -9,7 +9,7 @@ SELECT http_get('https://example.com/');
 Catalog Error: Scalar Function with name http_get does not exist!
 
 # Require statement will ensure this test is run with this extension loaded
-require httputil_request
+require http_request
 
 # httpfs provides https support
 require httpfs
