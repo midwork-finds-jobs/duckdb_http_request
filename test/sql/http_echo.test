@@ -1,0 +1,121 @@
+# name: test/sql/http_echo.test
+# description: test all HTTP methods with echo server
+# group: [sql]
+
+require httputil_request
+
+require httpfs
+
+# Load JSON extension for parsing echo server responses
+statement ok
+INSTALL json;
+
+statement ok
+LOAD json;
+
+#------------------------------------------------------------------------------
+# http_get - verify method, headers, and params
+#------------------------------------------------------------------------------
+
+# GET scalar - verify method
+query I
+SELECT decode(http_get('https://echo.free.beeceptor.com/').body)::JSON->>'method';
+----
+GET
+
+# GET scalar with headers and params - verify all passed correctly (single request via CTE)
+query III
+WITH resp AS (SELECT decode(http_get('https://echo.free.beeceptor.com/', {'X-Custom': 'test'}, {'foo': 'bar'}).body)::JSON as j)
+SELECT j->>'method', j->'headers'->>'X-Custom', j->'parsedQueryParams'->>'foo' FROM resp;
+----
+GET	test	bar
+
+# GET table function with named params (reordered)
+query II
+WITH resp AS (SELECT decode(body)::JSON as j FROM http_get('https://echo.free.beeceptor.com/', params := {'p': '1'}, headers := {'H': '2'}))
+SELECT j->'headers'->>'H', j->'parsedQueryParams'->>'p' FROM resp;
+----
+2	1
+
+#------------------------------------------------------------------------------
+# http_head - verify status and empty body
+#------------------------------------------------------------------------------
+
+query II
+WITH resp AS (SELECT * FROM http_head('https://echo.free.beeceptor.com/'))
+SELECT status, octet_length(body) FROM resp;
+----
+200	0
+
+#------------------------------------------------------------------------------
+# http_delete - verify method and headers
+#------------------------------------------------------------------------------
+
+query II
+WITH resp AS (SELECT decode(http_delete('https://echo.free.beeceptor.com/', {'Auth': 'token'}).body)::JSON as j)
+SELECT j->>'method', j->'headers'->>'Auth' FROM resp;
+----
+DELETE	token
+
+#------------------------------------------------------------------------------
+# http_post - verify method, body, and content-type
+#------------------------------------------------------------------------------
+
+query III
+WITH resp AS (SELECT decode(http_post('https://echo.free.beeceptor.com/', 'hello', {'Content-Type': 'text/plain'}).body)::JSON as j)
+SELECT j->>'method', j->>'rawBody', j->'headers'->>'Content-Type' FROM resp;
+----
+POST	hello	text/plain
+
+# POST table function
+query II
+WITH resp AS (SELECT decode(body)::JSON as j FROM http_post('https://echo.free.beeceptor.com/', body := 'table post'))
+SELECT j->>'method', j->>'rawBody' FROM resp;
+----
+POST	table post
+
+#------------------------------------------------------------------------------
+# http_put - verify method and body
+#------------------------------------------------------------------------------
+
+query II
+WITH resp AS (SELECT decode(http_put('https://echo.free.beeceptor.com/', 'put data').body)::JSON as j)
+SELECT j->>'method', j->>'rawBody' FROM resp;
+----
+PUT	put data
+
+#------------------------------------------------------------------------------
+# http_patch - verify method and body
+#------------------------------------------------------------------------------
+
+query II
+WITH resp AS (SELECT decode(http_patch('https://echo.free.beeceptor.com/', 'patch data').body)::JSON as j)
+SELECT j->>'method', j->>'rawBody' FROM resp;
+----
+PATCH	patch data
+
+#------------------------------------------------------------------------------
+# http_post_form - verify form encoding
+#------------------------------------------------------------------------------
+
+query III
+WITH resp AS (SELECT decode(http_post_form('https://echo.free.beeceptor.com/', {'user': 'john', 'pass': 'secret'}).body)::JSON as j)
+SELECT j->>'method', j->'headers'->>'Content-Type', j->'parsedBody'->>'user' FROM resp;
+----
+POST	application/x-www-form-urlencoded	john
+
+# POST form table function with headers
+query II
+WITH resp AS (SELECT decode(body)::JSON as j FROM http_post_form('https://echo.free.beeceptor.com/', params := {'key': 'val'}, headers := {'X-Form': 'yes'}))
+SELECT j->'parsedBody'->>'key', j->'headers'->>'X-Form' FROM resp;
+----
+val	yes
+
+#------------------------------------------------------------------------------
+# URL encoding test
+#------------------------------------------------------------------------------
+
+query I
+SELECT decode(http_post_form('https://echo.free.beeceptor.com/', {'msg': 'hello world'}).body)::JSON->'parsedBody'->>'msg';
+----
+hello world

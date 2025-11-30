@@ -1,0 +1,65 @@
+name: Unit Tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}
+  cancel-in-progress: true
+
+jobs:
+  test-linux:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    env:
+      GEN: ninja
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 #v4
+        with:
+          fetch-depth: 0
+          submodules: 'true'
+
+      - name: Install Ninja
+        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@abed23940f9d7bc267b0e1a21ee7b699a3794baa #v11.1
+        with:
+          vcpkgGitCommitId: ce613c41372b23b1f51333815feb3edd87ef8a8b
+
+      - name: Build
+        run: make release VCPKG_TOOLCHAIN_PATH=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+        env:
+          VCPKG_TARGET_TRIPLET: x64-linux
+
+      - name: Run Unit Tests
+        run: ./build/release/test/unittest --test-dir test
+
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    env:
+      GEN: ninja
+      OSX_BUILD_ARCH: x86_64
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 #v4
+        with:
+          fetch-depth: 0
+          submodules: 'true'
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@abed23940f9d7bc267b0e1a21ee7b699a3794baa #v11.1
+        with:
+          vcpkgGitCommitId: ce613c41372b23b1f51333815feb3edd87ef8a8b
+
+      - name: Build
+        run: make release VCPKG_TOOLCHAIN_PATH=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+        env:
+          VCPKG_TARGET_TRIPLET: x64-osx
+
+      - name: Run Unit Tests
+        run: ./build/release/test/unittest --test-dir test

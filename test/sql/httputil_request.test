@@ -1,0 +1,154 @@
+# name: test/sql/httputil_request.test
+# description: test httputil_request extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT http_get('https://example.com/');
+----
+Catalog Error: Scalar Function with name http_get does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require httputil_request
+
+# httpfs provides https support
+require httpfs
+
+#------------------------------------------------------------------------------
+# byte_range helper function
+#------------------------------------------------------------------------------
+
+query I
+SELECT byte_range(0, 100);
+----
+bytes=0-99
+
+query I
+SELECT byte_range(727608633, 1278);
+----
+bytes=727608633-727609910
+
+query I
+SELECT byte_range(1000, 1);
+----
+bytes=1000-1000
+
+#------------------------------------------------------------------------------
+# http_get scalar function
+#------------------------------------------------------------------------------
+
+# Basic GET returns struct with status, headers, body
+query I
+SELECT http_get('https://example.com/').status;
+----
+200
+
+# Body is returned as BLOB
+query I
+SELECT octet_length(http_get('https://example.com/').body) > 0;
+----
+true
+
+# Headers are returned as MAP
+query I
+SELECT http_get('https://example.com/').headers['Content-Type'] IS NOT NULL;
+----
+true
+
+# GET with custom headers
+query I
+SELECT http_get('https://httpbin.org/get', {'Accept': 'application/json'}).status;
+----
+200
+
+#------------------------------------------------------------------------------
+# http_head scalar function
+#------------------------------------------------------------------------------
+
+query I
+SELECT http_head('https://example.com/').status;
+----
+200
+
+# HEAD returns empty body
+query I
+SELECT octet_length(http_head('https://example.com/').body);
+----
+0
+
+# HEAD with custom headers
+query I
+SELECT http_head('https://httpbin.org/get', {'Accept': 'application/json'}).status;
+----
+200
+
+#------------------------------------------------------------------------------
+# http_get table function
+#------------------------------------------------------------------------------
+
+query I
+SELECT status FROM http_get('https://example.com/');
+----
+200
+
+query I
+SELECT octet_length(body) > 0 FROM http_get('https://example.com/');
+----
+true
+
+# Table function with named headers parameter
+query I
+SELECT status FROM http_get('https://httpbin.org/get', headers := {'Accept': 'application/json'});
+----
+200
+
+#------------------------------------------------------------------------------
+# http_head table function
+#------------------------------------------------------------------------------
+
+query I
+SELECT status FROM http_head('https://example.com/');
+----
+200
+
+query I
+SELECT octet_length(body) FROM http_head('https://example.com/');
+----
+0
+
+# Table function with named headers parameter
+query I
+SELECT status FROM http_head('https://httpbin.org/get', headers := {'Accept': 'text/html'});
+----
+200
+
+#------------------------------------------------------------------------------
+# Byte range requests (HTTP 206 Partial Content)
+#------------------------------------------------------------------------------
+
+# Using byte_range helper in headers struct
+query I
+SELECT http_get(
+    'https://data.commoncrawl.org/crawl-data/CC-MAIN-2024-46/segments/1730477027552.27/warc/CC-MAIN-20241101184224-20241101214224-00238.warc.gz',
+    {'Range': byte_range(727608633, 1278)}
+).status;
+----
+206
+
+# Auto-decompresses gzip, body should be larger than requested range
+query I
+SELECT octet_length(http_get(
+    'https://data.commoncrawl.org/crawl-data/CC-MAIN-2024-46/segments/1730477027552.27/warc/CC-MAIN-20241101184224-20241101214224-00238.warc.gz',
+    {'Range': byte_range(727608633, 1278)}
+).body) > 1278;
+----
+true
+
+# Table function with byte range
+query I
+SELECT status FROM http_get(
+    'https://data.commoncrawl.org/crawl-data/CC-MAIN-2024-46/segments/1730477027552.27/warc/CC-MAIN-20241101184224-20241101214224-00238.warc.gz',
+    headers := {'Range': byte_range(727608633, 1278)}
+);
+----
+206
