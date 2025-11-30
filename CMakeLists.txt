@@ -6,6 +6,7 @@ set(TARGET_NAME http_request)
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
 # used in cmake with find_package.
 find_package(OpenSSL REQUIRED)
+find_package(CURL REQUIRED)
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
