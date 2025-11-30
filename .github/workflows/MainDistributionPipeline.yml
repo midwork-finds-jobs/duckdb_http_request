@@ -27,4 +27,5 @@ jobs:
       duckdb_version: v1.4.2
       ci_tools_version: v1.4.2
       extension_name: http_request
-      format_checks: 'format;tidy'
+      # Skip tidy - httpfs dep doesn't support CLANG_TIDY conditional
+      format_checks: 'format'
