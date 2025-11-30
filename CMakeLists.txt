@@ -27,6 +27,19 @@ set(EXTENSION_SOURCES src/http_request_extension.cpp)
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+# Strip symbols in release builds to reduce extension size
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  if(APPLE)
+    add_custom_command(TARGET ${LOADABLE_EXTENSION_NAME} POST_BUILD
+      COMMAND strip -x $<TARGET_FILE:${LOADABLE_EXTENSION_NAME}>
+      COMMENT "Stripping symbols from ${LOADABLE_EXTENSION_NAME}")
+  elseif(UNIX)
+    add_custom_command(TARGET ${LOADABLE_EXTENSION_NAME} POST_BUILD
+      COMMAND strip --strip-unneeded $<TARGET_FILE:${LOADABLE_EXTENSION_NAME}>
+      COMMENT "Stripping symbols from ${LOADABLE_EXTENSION_NAME}")
+  endif()
+endif()
+
 # Link OpenSSL in both the static library as the loadable extension
 if(NOT CLANG_TIDY)
   target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
