@@ -215,9 +215,8 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 		}
 	}
 
-	// Build headers
+	// Build headers - add user headers first so they can override defaults
 	duckdb_httplib_openssl::Headers headers;
-	headers.insert({"User-Agent", StringUtil::Format("%s %s", db.config.UserAgent(), DuckDB::SourceID())});
 
 	if (!headers_val.IsNull()) {
 		auto &struct_type = headers_val.type();
@@ -228,6 +227,11 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 				headers.insert({child_types[i].first, children[i].ToString()});
 			}
 		}
+	}
+
+	// Set default User-Agent only if not provided by user
+	if (headers.find("User-Agent") == headers.end()) {
+		headers.insert({"User-Agent", StringUtil::Format("%s %s", db.config.UserAgent(), DuckDB::SourceID())});
 	}
 
 	string response_body;
