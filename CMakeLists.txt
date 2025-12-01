@@ -28,12 +28,10 @@ build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 # Strip symbols in release builds to reduce extension size
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-  if(APPLE)
-    add_custom_command(TARGET ${LOADABLE_EXTENSION_NAME} POST_BUILD
-      COMMAND strip -x $<TARGET_FILE:${LOADABLE_EXTENSION_NAME}>
-      COMMENT "Stripping symbols from ${LOADABLE_EXTENSION_NAME}")
-  elseif(UNIX)
+# Note: On macOS, we use strip -x which is more compatible with the DuckDB extension format
+# The strip runs before extension metadata is appended by the build system
+if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT APPLE)
+  if(UNIX)
     add_custom_command(TARGET ${LOADABLE_EXTENSION_NAME} POST_BUILD
       COMMAND strip --strip-unneeded $<TARGET_FILE:${LOADABLE_EXTENSION_NAME}>
       COMMENT "Stripping symbols from ${LOADABLE_EXTENSION_NAME}")
