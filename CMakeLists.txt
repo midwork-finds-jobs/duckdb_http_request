@@ -5,15 +5,12 @@ set(TARGET_NAME http_request)
 
 project(${TARGET_NAME})
 
-# DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
-# used in cmake with find_package.
-# For clang-tidy checks, we make these optional as they're not needed for static analysis
+# OpenSSL is needed for HTTPS support via httplib
+# For clang-tidy checks, we make it optional as it's not needed for static analysis
 if(CLANG_TIDY)
   find_package(OpenSSL)
-  find_package(CURL)
 else()
   find_package(OpenSSL REQUIRED)
-  find_package(CURL REQUIRED)
 endif()
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
