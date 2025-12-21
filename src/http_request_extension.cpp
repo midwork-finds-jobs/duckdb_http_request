@@ -293,9 +293,14 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 	status_code = res->status;
 	response_body = res->body;
 
+	// Collect headers into arrays (to handle duplicates like Set-Cookie)
+	unordered_map<string, vector<Value>> header_map;
 	for (auto &header : res->headers) {
+		header_map[header.first].push_back(Value(header.second));
+	}
+	for (auto &header : header_map) {
 		header_keys.push_back(Value(header.first));
-		header_values.push_back(Value(header.second));
+		header_values.push_back(Value::LIST(LogicalType::VARCHAR, std::move(header.second)));
 	}
 
 	// Auto-decompress based on magic bytes (using core GZipFileSystem::CheckIsZip for gzip)
@@ -326,16 +331,18 @@ static Value BuildHttpResponseValue(int32_t status_code, vector<Value> &header_k
 	child_list_t<Value> struct_values;
 	struct_values.push_back(make_pair("status", Value::INTEGER(status_code)));
 	struct_values.push_back(
-	    make_pair("headers", Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, header_keys, header_values)));
+	    make_pair("headers", Value::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR), header_keys,
+	                                    header_values)));
 	struct_values.push_back(make_pair("body", Value::BLOB_RAW(body)));
 	return Value::STRUCT(std::move(struct_values));
 }
 
-// http_response STRUCT type
+// http_response STRUCT type - headers is MAP(VARCHAR, VARCHAR[]) to handle duplicates
 static LogicalType CreateHttpResponseType() {
 	child_list_t<LogicalType> struct_children;
 	struct_children.push_back(make_pair("status", LogicalType::INTEGER));
-	struct_children.push_back(make_pair("headers", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)));
+	struct_children.push_back(
+	    make_pair("headers", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR))));
 	struct_children.push_back(make_pair("body", LogicalType::BLOB));
 	return LogicalType::STRUCT(std::move(struct_children));
 }
@@ -985,7 +992,7 @@ static void SetHttpReturnTypes(vector<LogicalType> &return_types, vector<string>
 	return_types.push_back(LogicalType::INTEGER);
 	names.push_back("status");
 
-	return_types.push_back(LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR));
+	return_types.push_back(LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)));
 	names.push_back("headers");
 
 	return_types.push_back(LogicalType::BLOB);
@@ -1221,7 +1228,8 @@ static void HttpTableFunction(ClientContext &context, TableFunctionInput &data_p
 
 	output.SetCardinality(1);
 	output.SetValue(0, 0, Value::INTEGER(status_code));
-	output.SetValue(1, 0, Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, header_keys, header_values));
+	output.SetValue(
+	    1, 0, Value::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR), header_keys, header_values));
 	output.SetValue(2, 0, Value::BLOB_RAW(response_body));
 }
 
