@@ -147,12 +147,114 @@ static void ParseUrl(const string &url, string &proto_host_port, string &path) {
 	}
 }
 
+// Cookie struct type for parsed Set-Cookie headers
+static LogicalType CreateCookieStructType() {
+	child_list_t<LogicalType> cookie_children;
+	cookie_children.push_back(make_pair("name", LogicalType::VARCHAR));
+	cookie_children.push_back(make_pair("value", LogicalType::VARCHAR));
+	cookie_children.push_back(make_pair("expires", LogicalType::VARCHAR));
+	cookie_children.push_back(make_pair("max_age", LogicalType::INTEGER));
+	cookie_children.push_back(make_pair("path", LogicalType::VARCHAR));
+	cookie_children.push_back(make_pair("domain", LogicalType::VARCHAR));
+	cookie_children.push_back(make_pair("secure", LogicalType::BOOLEAN));
+	cookie_children.push_back(make_pair("httponly", LogicalType::BOOLEAN));
+	cookie_children.push_back(make_pair("samesite", LogicalType::VARCHAR));
+	return LogicalType::STRUCT(std::move(cookie_children));
+}
+
+// Parse a single Set-Cookie header value into a struct
+static Value ParseSetCookieHeader(const string &cookie_str) {
+	child_list_t<Value> cookie_values;
+	string name, value, expires, path, domain, samesite;
+	Value max_age = Value(LogicalType::INTEGER); // NULL by default
+	bool secure = false, httponly = false;
+
+	// Split by ';'
+	vector<string> parts;
+	idx_t start = 0;
+	for (idx_t i = 0; i <= cookie_str.size(); i++) {
+		if (i == cookie_str.size() || cookie_str[i] == ';') {
+			if (i > start) {
+				string part = cookie_str.substr(start, i - start);
+				StringUtil::Trim(part);
+				if (!part.empty()) {
+					parts.push_back(part);
+				}
+			}
+			start = i + 1;
+		}
+	}
+
+	// First part is name=value
+	if (!parts.empty()) {
+		auto eq_pos = parts[0].find('=');
+		if (eq_pos != string::npos) {
+			name = parts[0].substr(0, eq_pos);
+			value = parts[0].substr(eq_pos + 1);
+			StringUtil::Trim(name);
+			StringUtil::Trim(value);
+		} else {
+			name = parts[0];
+		}
+	}
+
+	// Parse remaining attributes
+	for (idx_t i = 1; i < parts.size(); i++) {
+		string &part = parts[i];
+		auto eq_pos = part.find('=');
+		string attr_name, attr_value;
+		if (eq_pos != string::npos) {
+			attr_name = part.substr(0, eq_pos);
+			attr_value = part.substr(eq_pos + 1);
+			StringUtil::Trim(attr_name);
+			StringUtil::Trim(attr_value);
+		} else {
+			attr_name = part;
+			StringUtil::Trim(attr_name);
+		}
+
+		// Case-insensitive attribute matching
+		if (StringUtil::CIEquals(attr_name, "expires")) {
+			expires = attr_value;
+		} else if (StringUtil::CIEquals(attr_name, "max-age")) {
+			try {
+				max_age = Value::INTEGER(std::stoi(attr_value));
+			} catch (...) {
+				// Invalid max-age, keep NULL
+			}
+		} else if (StringUtil::CIEquals(attr_name, "path")) {
+			path = attr_value;
+		} else if (StringUtil::CIEquals(attr_name, "domain")) {
+			domain = attr_value;
+		} else if (StringUtil::CIEquals(attr_name, "secure")) {
+			secure = true;
+		} else if (StringUtil::CIEquals(attr_name, "httponly")) {
+			httponly = true;
+		} else if (StringUtil::CIEquals(attr_name, "samesite")) {
+			samesite = attr_value;
+		}
+	}
+
+	cookie_values.push_back(make_pair("name", Value(name)));
+	cookie_values.push_back(make_pair("value", Value(value)));
+	cookie_values.push_back(make_pair("expires", expires.empty() ? Value(LogicalType::VARCHAR) : Value(expires)));
+	cookie_values.push_back(make_pair("max_age", max_age));
+	cookie_values.push_back(make_pair("path", path.empty() ? Value(LogicalType::VARCHAR) : Value(path)));
+	cookie_values.push_back(make_pair("domain", domain.empty() ? Value(LogicalType::VARCHAR) : Value(domain)));
+	cookie_values.push_back(make_pair("secure", Value::BOOLEAN(secure)));
+	cookie_values.push_back(make_pair("httponly", Value::BOOLEAN(httponly)));
+	cookie_values.push_back(make_pair("samesite", samesite.empty() ? Value(LogicalType::VARCHAR) : Value(samesite)));
+
+	return Value::STRUCT(std::move(cookie_values));
+}
+
 // Core HTTP request logic - used by both scalar and table functions
 // Supports GET, HEAD, POST, PUT, PATCH, DELETE methods
 // For POST/PUT/PATCH, request_body contains the body to send
 static void PerformHttpRequestCore(ClientContext &context, const string &url, const string &method,
                                    const Value &headers_val, const string &request_body, const string &content_type,
-                                   int32_t &status_code, vector<Value> &header_keys, vector<Value> &header_values,
+                                   int32_t &status_code, string &resp_content_type, int64_t &resp_content_length,
+                                   vector<Value> &header_keys, vector<Value> &header_values, vector<Value> &cookies,
                                    string &final_body) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto &config = db.config;
@@ -293,14 +395,40 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 	status_code = res->status;
 	response_body = res->body;
 
-	// Collect headers into arrays (to handle duplicates like Set-Cookie)
-	unordered_map<string, vector<Value>> header_map;
+	// Initialize extracted fields
+	resp_content_type = "";
+	resp_content_length = -1;
+
+	// Collect headers - Set-Cookie goes to cookies array, others to headers map
 	for (auto &header : res->headers) {
-		header_map[header.first].push_back(Value(header.second));
-	}
-	for (auto &header : header_map) {
-		header_keys.push_back(Value(header.first));
-		header_values.push_back(Value::LIST(LogicalType::VARCHAR, std::move(header.second)));
+		if (StringUtil::CIEquals(header.first, "Set-Cookie")) {
+			cookies.push_back(ParseSetCookieHeader(header.second));
+		} else {
+			// Extract convenience fields
+			if (StringUtil::CIEquals(header.first, "Content-Type")) {
+				resp_content_type = header.second;
+			} else if (StringUtil::CIEquals(header.first, "Content-Length")) {
+				try {
+					resp_content_length = std::stoll(header.second);
+				} catch (...) {
+					// Invalid content-length, keep -1
+				}
+			}
+
+			// For duplicate non-cookie headers, last value wins
+			bool found = false;
+			for (idx_t i = 0; i < header_keys.size(); i++) {
+				if (header_keys[i].GetValue<string>() == header.first) {
+					header_values[i] = Value(header.second);
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				header_keys.push_back(Value(header.first));
+				header_values.push_back(Value(header.second));
+			}
+		}
 	}
 
 	// Auto-decompress based on magic bytes (using core GZipFileSystem::CheckIsZip for gzip)
@@ -319,30 +447,43 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 
 // Convenience overload without body (for GET, HEAD, DELETE)
 static void PerformHttpRequestCore(ClientContext &context, const string &url, const string &method,
-                                   const Value &headers_val, int32_t &status_code, vector<Value> &header_keys,
-                                   vector<Value> &header_values, string &final_body) {
-	PerformHttpRequestCore(context, url, method, headers_val, "", "", status_code, header_keys, header_values,
-	                       final_body);
+                                   const Value &headers_val, int32_t &status_code, string &resp_content_type,
+                                   int64_t &resp_content_length, vector<Value> &header_keys,
+                                   vector<Value> &header_values, vector<Value> &cookies, string &final_body) {
+	PerformHttpRequestCore(context, url, method, headers_val, "", "", status_code, resp_content_type,
+	                       resp_content_length, header_keys, header_values, cookies, final_body);
+}
+
+// Headers type: MAP(VARCHAR, VARCHAR) - single values, Set-Cookie handled separately
+static LogicalType CreateHeadersMapType() {
+	return LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 }
 
 // Build response STRUCT value
-static Value BuildHttpResponseValue(int32_t status_code, vector<Value> &header_keys, vector<Value> &header_values,
+static Value BuildHttpResponseValue(int32_t status_code, const string &content_type, int64_t content_length,
+                                    vector<Value> &header_keys, vector<Value> &header_values, vector<Value> &cookies,
                                     const string &body) {
 	child_list_t<Value> struct_values;
 	struct_values.push_back(make_pair("status", Value::INTEGER(status_code)));
 	struct_values.push_back(
-	    make_pair("headers", Value::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR), header_keys,
-	                                    header_values)));
+	    make_pair("content_type", content_type.empty() ? Value(LogicalType::VARCHAR) : Value(content_type)));
+	struct_values.push_back(
+	    make_pair("content_length", content_length < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(content_length)));
+	struct_values.push_back(
+	    make_pair("headers", Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, header_keys, header_values)));
+	struct_values.push_back(make_pair("cookies", Value::LIST(CreateCookieStructType(), std::move(cookies))));
 	struct_values.push_back(make_pair("body", Value::BLOB_RAW(body)));
 	return Value::STRUCT(std::move(struct_values));
 }
 
-// http_response STRUCT type - headers is MAP(VARCHAR, VARCHAR[]) to handle duplicates
+// http_response STRUCT type
 static LogicalType CreateHttpResponseType() {
 	child_list_t<LogicalType> struct_children;
 	struct_children.push_back(make_pair("status", LogicalType::INTEGER));
-	struct_children.push_back(
-	    make_pair("headers", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR))));
+	struct_children.push_back(make_pair("content_type", LogicalType::VARCHAR));
+	struct_children.push_back(make_pair("content_length", LogicalType::BIGINT));
+	struct_children.push_back(make_pair("headers", CreateHeadersMapType()));
+	struct_children.push_back(make_pair("cookies", LogicalType::LIST(CreateCookieStructType())));
 	struct_children.push_back(make_pair("body", LogicalType::BLOB));
 	return LogicalType::STRUCT(std::move(struct_children));
 }
@@ -421,10 +562,14 @@ static void HttpHeadScalar1(DataChunk &args, ExpressionState &state, Vector &res
 	for (idx_t i = 0; i < count; i++) {
 		auto url = url_vec.GetValue(i).GetValue<string>();
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string body;
-		PerformHttpRequestCore(context, url, "HEAD", Value(), status_code, header_keys, header_values, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, body));
+		PerformHttpRequestCore(context, url, "HEAD", Value(), status_code, content_type, content_length, header_keys,
+		                       header_values, cookies, body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, body));
 	}
 }
 
@@ -439,10 +584,14 @@ static void HttpHeadScalar2(DataChunk &args, ExpressionState &state, Vector &res
 		auto url = url_vec.GetValue(i).GetValue<string>();
 		auto headers = headers_vec.GetValue(i);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string body;
-		PerformHttpRequestCore(context, url, "HEAD", headers, status_code, header_keys, header_values, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, body));
+		PerformHttpRequestCore(context, url, "HEAD", headers, status_code, content_type, content_length, header_keys,
+		                       header_values, cookies, body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, body));
 	}
 }
 
@@ -460,10 +609,14 @@ static void HttpHeadScalar3(DataChunk &args, ExpressionState &state, Vector &res
 		auto params = params_vec.GetValue(i);
 		url = BuildUrlWithParams(url, params);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string body;
-		PerformHttpRequestCore(context, url, "HEAD", headers, status_code, header_keys, header_values, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, body));
+		PerformHttpRequestCore(context, url, "HEAD", headers, status_code, content_type, content_length, header_keys,
+		                       header_values, cookies, body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, body));
 	}
 }
 
@@ -498,10 +651,14 @@ static void HttpGetScalar1(DataChunk &args, ExpressionState &state, Vector &resu
 	for (idx_t i = 0; i < count; i++) {
 		auto url = url_vec.GetValue(i).GetValue<string>();
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string body;
-		PerformHttpRequestCore(context, url, "GET", Value(), status_code, header_keys, header_values, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, body));
+		PerformHttpRequestCore(context, url, "GET", Value(), status_code, content_type, content_length, header_keys,
+		                       header_values, cookies, body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, body));
 	}
 }
 
@@ -516,10 +673,14 @@ static void HttpGetScalar2(DataChunk &args, ExpressionState &state, Vector &resu
 		auto url = url_vec.GetValue(i).GetValue<string>();
 		auto headers = headers_vec.GetValue(i);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string body;
-		PerformHttpRequestCore(context, url, "GET", headers, status_code, header_keys, header_values, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, body));
+		PerformHttpRequestCore(context, url, "GET", headers, status_code, content_type, content_length, header_keys,
+		                       header_values, cookies, body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, body));
 	}
 }
 
@@ -537,10 +698,14 @@ static void HttpGetScalar3(DataChunk &args, ExpressionState &state, Vector &resu
 		auto params = params_vec.GetValue(i);
 		auto url = BuildUrlWithParams(base_url, params);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string body;
-		PerformHttpRequestCore(context, url, "GET", headers, status_code, header_keys, header_values, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, body));
+		PerformHttpRequestCore(context, url, "GET", headers, status_code, content_type, content_length, header_keys,
+		                       header_values, cookies, body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, body));
 	}
 }
 
@@ -582,10 +747,14 @@ static void HttpDeleteScalar1(DataChunk &args, ExpressionState &state, Vector &r
 	for (idx_t i = 0; i < count; i++) {
 		auto url = url_vec.GetValue(i).GetValue<string>();
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string body;
-		PerformHttpRequestCore(context, url, "DELETE", Value(), status_code, header_keys, header_values, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, body));
+		PerformHttpRequestCore(context, url, "DELETE", Value(), status_code, content_type, content_length, header_keys,
+		                       header_values, cookies, body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, body));
 	}
 }
 
@@ -600,10 +769,14 @@ static void HttpDeleteScalar2(DataChunk &args, ExpressionState &state, Vector &r
 		auto url = url_vec.GetValue(i).GetValue<string>();
 		auto headers = headers_vec.GetValue(i);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string body;
-		PerformHttpRequestCore(context, url, "DELETE", headers, status_code, header_keys, header_values, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, body));
+		PerformHttpRequestCore(context, url, "DELETE", headers, status_code, content_type, content_length, header_keys,
+		                       header_values, cookies, body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, body));
 	}
 }
 
@@ -621,10 +794,14 @@ static void HttpDeleteScalar3(DataChunk &args, ExpressionState &state, Vector &r
 		auto params = params_vec.GetValue(i);
 		auto url = BuildUrlWithParams(base_url, params);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string body;
-		PerformHttpRequestCore(context, url, "DELETE", headers, status_code, header_keys, header_values, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, body));
+		PerformHttpRequestCore(context, url, "DELETE", headers, status_code, content_type, content_length, header_keys,
+		                       header_values, cookies, body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, body));
 	}
 }
 
@@ -663,11 +840,14 @@ static void HttpPostScalar1(DataChunk &args, ExpressionState &state, Vector &res
 	for (idx_t i = 0; i < count; i++) {
 		auto url = url_vec.GetValue(i).GetValue<string>();
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string response_body;
-		PerformHttpRequestCore(context, url, "POST", Value(), "", "application/octet-stream", status_code, header_keys,
-		                       header_values, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+		PerformHttpRequestCore(context, url, "POST", Value(), "", "application/octet-stream", status_code, content_type,
+		                       content_length, header_keys, header_values, cookies, response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, response_body));
 	}
 }
 
@@ -682,11 +862,14 @@ static void HttpPostScalar2(DataChunk &args, ExpressionState &state, Vector &res
 		auto url = url_vec.GetValue(i).GetValue<string>();
 		auto headers = headers_vec.GetValue(i);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string response_body;
-		PerformHttpRequestCore(context, url, "POST", headers, "", "", status_code, header_keys, header_values,
-		                       response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+		PerformHttpRequestCore(context, url, "POST", headers, "", "", status_code, content_type, content_length,
+		                       header_keys, header_values, cookies, response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, response_body));
 	}
 }
 
@@ -704,11 +887,14 @@ static void HttpPostScalar3(DataChunk &args, ExpressionState &state, Vector &res
 		auto params = params_vec.GetValue(i);
 		auto url = BuildUrlWithParams(base_url, params);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string response_body;
-		PerformHttpRequestCore(context, url, "POST", headers, "", "", status_code, header_keys, header_values,
-		                       response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+		PerformHttpRequestCore(context, url, "POST", headers, "", "", status_code, content_type, content_length,
+		                       header_keys, header_values, cookies, response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, response_body));
 	}
 }
 
@@ -747,11 +933,14 @@ static void HttpPutScalar1(DataChunk &args, ExpressionState &state, Vector &resu
 	for (idx_t i = 0; i < count; i++) {
 		auto url = url_vec.GetValue(i).GetValue<string>();
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string response_body;
-		PerformHttpRequestCore(context, url, "PUT", Value(), "", "application/octet-stream", status_code, header_keys,
-		                       header_values, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+		PerformHttpRequestCore(context, url, "PUT", Value(), "", "application/octet-stream", status_code, content_type,
+		                       content_length, header_keys, header_values, cookies, response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, response_body));
 	}
 }
 
@@ -766,11 +955,14 @@ static void HttpPutScalar2(DataChunk &args, ExpressionState &state, Vector &resu
 		auto url = url_vec.GetValue(i).GetValue<string>();
 		auto headers = headers_vec.GetValue(i);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string response_body;
-		PerformHttpRequestCore(context, url, "PUT", headers, "", "", status_code, header_keys, header_values,
-		                       response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+		PerformHttpRequestCore(context, url, "PUT", headers, "", "", status_code, content_type, content_length,
+		                       header_keys, header_values, cookies, response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, response_body));
 	}
 }
 
@@ -788,11 +980,14 @@ static void HttpPutScalar3(DataChunk &args, ExpressionState &state, Vector &resu
 		auto params = params_vec.GetValue(i);
 		auto url = BuildUrlWithParams(base_url, params);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string response_body;
-		PerformHttpRequestCore(context, url, "PUT", headers, "", "", status_code, header_keys, header_values,
-		                       response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+		PerformHttpRequestCore(context, url, "PUT", headers, "", "", status_code, content_type, content_length,
+		                       header_keys, header_values, cookies, response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, response_body));
 	}
 }
 
@@ -831,11 +1026,14 @@ static void HttpPatchScalar1(DataChunk &args, ExpressionState &state, Vector &re
 	for (idx_t i = 0; i < count; i++) {
 		auto url = url_vec.GetValue(i).GetValue<string>();
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string response_body;
-		PerformHttpRequestCore(context, url, "PATCH", Value(), "", "application/octet-stream", status_code, header_keys,
-		                       header_values, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+		PerformHttpRequestCore(context, url, "PATCH", Value(), "", "application/octet-stream", status_code,
+		                       content_type, content_length, header_keys, header_values, cookies, response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, response_body));
 	}
 }
 
@@ -850,11 +1048,14 @@ static void HttpPatchScalar2(DataChunk &args, ExpressionState &state, Vector &re
 		auto url = url_vec.GetValue(i).GetValue<string>();
 		auto headers = headers_vec.GetValue(i);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string response_body;
-		PerformHttpRequestCore(context, url, "PATCH", headers, "", "", status_code, header_keys, header_values,
-		                       response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+		PerformHttpRequestCore(context, url, "PATCH", headers, "", "", status_code, content_type, content_length,
+		                       header_keys, header_values, cookies, response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, response_body));
 	}
 }
 
@@ -872,11 +1073,14 @@ static void HttpPatchScalar3(DataChunk &args, ExpressionState &state, Vector &re
 		auto params = params_vec.GetValue(i);
 		auto url = BuildUrlWithParams(base_url, params);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string response_body;
-		PerformHttpRequestCore(context, url, "PATCH", headers, "", "", status_code, header_keys, header_values,
-		                       response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+		PerformHttpRequestCore(context, url, "PATCH", headers, "", "", status_code, content_type, content_length,
+		                       header_keys, header_values, cookies, response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, response_body));
 	}
 }
 
@@ -918,11 +1122,15 @@ static void HttpPostFormScalar2(DataChunk &args, ExpressionState &state, Vector 
 		auto params = params_vec.GetValue(i);
 		auto form_body = BuildFormEncodedBody(params);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string response_body;
 		PerformHttpRequestCore(context, url, "POST", Value(), form_body, "application/x-www-form-urlencoded",
-		                       status_code, header_keys, header_values, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+		                       status_code, content_type, content_length, header_keys, header_values, cookies,
+		                       response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, response_body));
 	}
 }
 
@@ -940,11 +1148,15 @@ static void HttpPostFormScalar3(DataChunk &args, ExpressionState &state, Vector 
 		auto headers = headers_vec.GetValue(i);
 		auto form_body = BuildFormEncodedBody(params);
 		int32_t status_code;
-		vector<Value> header_keys, header_values;
+		string content_type;
+		int64_t content_length;
+		vector<Value> header_keys, header_values, cookies;
 		string response_body;
 		PerformHttpRequestCore(context, url, "POST", headers, form_body, "application/x-www-form-urlencoded",
-		                       status_code, header_keys, header_values, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, header_keys, header_values, response_body));
+		                       status_code, content_type, content_length, header_keys, header_values, cookies,
+		                       response_body);
+		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
+		                                          cookies, response_body));
 	}
 }
 
@@ -992,8 +1204,17 @@ static void SetHttpReturnTypes(vector<LogicalType> &return_types, vector<string>
 	return_types.push_back(LogicalType::INTEGER);
 	names.push_back("status");
 
-	return_types.push_back(LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)));
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("content_type");
+
+	return_types.push_back(LogicalType::BIGINT);
+	names.push_back("content_length");
+
+	return_types.push_back(CreateHeadersMapType());
 	names.push_back("headers");
+
+	return_types.push_back(LogicalType::LIST(CreateCookieStructType()));
+	names.push_back("cookies");
 
 	return_types.push_back(LogicalType::BLOB);
 	names.push_back("body");
@@ -1220,17 +1441,22 @@ static void HttpTableFunction(ClientContext &context, TableFunctionInput &data_p
 	state.done = true;
 
 	int32_t status_code;
-	vector<Value> header_keys, header_values;
+	string resp_content_type;
+	int64_t resp_content_length;
+	vector<Value> header_keys, header_values, cookies;
 	string response_body;
 
 	PerformHttpRequestCore(context, bind_data.url, bind_data.method, bind_data.headers, bind_data.body,
-	                       bind_data.content_type, status_code, header_keys, header_values, response_body);
+	                       bind_data.content_type, status_code, resp_content_type, resp_content_length, header_keys,
+	                       header_values, cookies, response_body);
 
 	output.SetCardinality(1);
 	output.SetValue(0, 0, Value::INTEGER(status_code));
-	output.SetValue(
-	    1, 0, Value::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR), header_keys, header_values));
-	output.SetValue(2, 0, Value::BLOB_RAW(response_body));
+	output.SetValue(1, 0, resp_content_type.empty() ? Value(LogicalType::VARCHAR) : Value(resp_content_type));
+	output.SetValue(2, 0, resp_content_length < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(resp_content_length));
+	output.SetValue(3, 0, Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, header_keys, header_values));
+	output.SetValue(4, 0, Value::LIST(CreateCookieStructType(), std::move(cookies)));
+	output.SetValue(5, 0, Value::BLOB_RAW(response_body));
 }
 
 //------------------------------------------------------------------------------
