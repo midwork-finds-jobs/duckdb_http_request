@@ -22,3 +22,18 @@ curl -s -r"$OFFSET-$((OFFSET + LENGTH - 1))"     "https://data.commoncrawl.org/$
 ```
 
 Do not add new http libraries! Use the httputil from duckdb. Autoload `httpfs` with this extension.
+
+## Releasing new versions
+
+After significant changes, suggest releasing a new version:
+
+1. Commit changes
+2. Create tag: `git tag -a vX.Y.Z -m "vX.Y.Z: Description"`
+3. Push: `git push origin HEAD && git push origin vX.Y.Z`
+4. Update community-extensions:
+   - Clone/update `/tmp/community-extensions` from duckdb/community-extensions
+   - Create branch: `git checkout -b update-http-request-vX.Y.Z`
+   - Update `extensions/http_request/description.yml` (version + ref + features)
+   - Push and create PR to duckdb/community-extensions
+
+The extension version comes from git tags (vX.Y.Z format).
