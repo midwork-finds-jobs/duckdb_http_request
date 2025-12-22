@@ -21,7 +21,14 @@
 
 #include "zstd.h"
 
+#include <atomic>
+#include <mutex>
+#include <thread>
+
 namespace duckdb {
+
+// Default max concurrent HTTP requests per scalar function call
+static constexpr idx_t DEFAULT_HTTP_MAX_CONCURRENT = 32;
 
 // Zstd magic number: 0xFD2FB528 (little-endian: 28 B5 2F FD)
 static constexpr uint8_t ZSTD_MAGIC_1 = 0x28;
@@ -58,6 +65,257 @@ static string DecompressZstd(const string &compressed) {
 	}
 
 	return string(buffer.data(), actual_size);
+}
+
+// Forward declarations
+static void ParseUrl(const string &url, string &proto_host_port, string &path);
+static Value ParseSetCookieHeader(const string &cookie_str);
+static Value BuildHttpResponseValue(int32_t status_code, const string &content_type, int64_t content_length,
+                                    vector<Value> &header_keys, vector<Value> &header_values, vector<Value> &cookies,
+                                    const string &body);
+
+// Struct to hold HTTP settings extracted from context (thread-safe to pass to workers)
+struct HttpSettings {
+	uint64_t timeout;
+	bool keep_alive;
+	string proxy;
+	string proxy_username;
+	string proxy_password;
+	string user_agent;
+	uint64_t max_concurrency;
+};
+
+// Struct to hold HTTP response (for parallel collection)
+struct HttpResponseData {
+	int32_t status_code;
+	string content_type;
+	int64_t content_length;
+	vector<Value> header_keys;
+	vector<Value> header_values;
+	vector<Value> cookies;
+	string body;
+	string error; // Non-empty if request failed
+};
+
+// Extract HTTP settings from context (call from main thread)
+static HttpSettings ExtractHttpSettings(ClientContext &context, const string &url) {
+	HttpSettings settings;
+	auto &db = DatabaseInstance::GetDatabase(context);
+	auto &config = db.config;
+
+	settings.timeout = 30;
+	settings.keep_alive = true;
+	settings.max_concurrency = DEFAULT_HTTP_MAX_CONCURRENT;
+
+	ClientContextFileOpener opener(context);
+	FileOpenerInfo info;
+	info.file_path = url;
+
+	FileOpener::TryGetCurrentSetting(&opener, "http_timeout", settings.timeout, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_keep_alive", settings.keep_alive, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_max_concurrency", settings.max_concurrency, &info);
+
+	settings.proxy = config.options.http_proxy;
+	settings.proxy_username = config.options.http_proxy_username;
+	settings.proxy_password = config.options.http_proxy_password;
+
+	KeyValueSecretReader secret_reader(opener, &info, "http");
+	string proxy_from_secret;
+	if (secret_reader.TryGetSecretKey<string>("http_proxy", proxy_from_secret) && !proxy_from_secret.empty()) {
+		settings.proxy = proxy_from_secret;
+	}
+	secret_reader.TryGetSecretKey<string>("http_proxy_username", settings.proxy_username);
+	secret_reader.TryGetSecretKey<string>("http_proxy_password", settings.proxy_password);
+
+	settings.user_agent = StringUtil::Format("%s %s", config.UserAgent(), DuckDB::SourceID());
+
+	return settings;
+}
+
+// Thread-safe HTTP request execution (no context dependency)
+static HttpResponseData ExecuteHttpRequestThreadSafe(const HttpSettings &settings, const string &url,
+                                                     const string &method,
+                                                     const duckdb_httplib_openssl::Headers &headers,
+                                                     const string &request_body, const string &content_type) {
+	HttpResponseData result;
+	result.status_code = 0;
+	result.content_length = -1;
+
+	try {
+		string proto_host_port, path;
+		ParseUrl(url, proto_host_port, path);
+
+		duckdb_httplib_openssl::Client client(proto_host_port);
+		client.set_follow_location(true);
+		client.set_decompress(false);
+		client.enable_server_certificate_verification(false);
+
+		auto timeout_sec = static_cast<time_t>(settings.timeout);
+		client.set_read_timeout(timeout_sec, 0);
+		client.set_write_timeout(timeout_sec, 0);
+		client.set_connection_timeout(timeout_sec, 0);
+		client.set_keep_alive(settings.keep_alive);
+
+		if (!settings.proxy.empty()) {
+			string proxy_host;
+			idx_t proxy_port = 80;
+			string proxy_copy = settings.proxy;
+			HTTPUtil::ParseHTTPProxyHost(proxy_copy, proxy_host, proxy_port);
+			client.set_proxy(proxy_host, static_cast<int>(proxy_port));
+			if (!settings.proxy_username.empty()) {
+				client.set_proxy_basic_auth(settings.proxy_username, settings.proxy_password);
+			}
+		}
+
+		duckdb_httplib_openssl::Headers req_headers = headers;
+		if (req_headers.find("User-Agent") == req_headers.end()) {
+			req_headers.insert({"User-Agent", settings.user_agent});
+		}
+
+		duckdb_httplib_openssl::Result res(nullptr, duckdb_httplib_openssl::Error::Unknown);
+
+		if (StringUtil::CIEquals(method, "HEAD")) {
+			res = client.Head(path, req_headers);
+		} else if (StringUtil::CIEquals(method, "DELETE")) {
+			res = client.Delete(path, req_headers);
+		} else if (StringUtil::CIEquals(method, "POST")) {
+			string ct = content_type.empty() ? "application/octet-stream" : content_type;
+			res = client.Post(path, req_headers, request_body, ct);
+		} else if (StringUtil::CIEquals(method, "PUT")) {
+			string ct = content_type.empty() ? "application/octet-stream" : content_type;
+			res = client.Put(path, req_headers, request_body, ct);
+		} else if (StringUtil::CIEquals(method, "PATCH")) {
+			string ct = content_type.empty() ? "application/octet-stream" : content_type;
+			res = client.Patch(path, req_headers, request_body, ct);
+		} else {
+			res = client.Get(path, req_headers);
+		}
+
+		if (res.error() != duckdb_httplib_openssl::Error::Success) {
+			result.error = "HTTP request failed: " + to_string(res.error());
+			return result;
+		}
+
+		result.status_code = res->status;
+		string response_body = res->body;
+
+		for (auto &header : res->headers) {
+			if (StringUtil::CIEquals(header.first, "Set-Cookie")) {
+				result.cookies.push_back(ParseSetCookieHeader(header.second));
+			} else {
+				if (StringUtil::CIEquals(header.first, "Content-Type")) {
+					result.content_type = header.second;
+				} else if (StringUtil::CIEquals(header.first, "Content-Length")) {
+					try {
+						result.content_length = std::stoll(header.second);
+					} catch (...) {
+					}
+				}
+				bool found = false;
+				for (idx_t i = 0; i < result.header_keys.size(); i++) {
+					if (result.header_keys[i].GetValue<string>() == header.first) {
+						result.header_values[i] = Value(header.second);
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					result.header_keys.push_back(Value(header.first));
+					result.header_values.push_back(Value(header.second));
+				}
+			}
+		}
+
+		// Auto-decompress
+		result.body = response_body;
+		try {
+			if (GZipFileSystem::CheckIsZip(response_body.data(), response_body.size())) {
+				result.body = GZipFileSystem::UncompressGZIPString(response_body);
+			} else if (CheckIsZstd(response_body.data(), response_body.size())) {
+				result.body = DecompressZstd(response_body);
+			}
+		} catch (...) {
+		}
+
+	} catch (std::exception &e) {
+		result.error = e.what();
+	}
+
+	return result;
+}
+
+// Convert Value headers to httplib Headers
+static duckdb_httplib_openssl::Headers ValueToHttplibHeaders(const Value &headers_val) {
+	duckdb_httplib_openssl::Headers headers;
+	if (headers_val.IsNull()) {
+		return headers;
+	}
+	auto &struct_type = headers_val.type();
+	auto &child_types = StructType::GetChildTypes(struct_type);
+	auto &children = StructValue::GetChildren(headers_val);
+	for (idx_t i = 0; i < child_types.size(); i++) {
+		if (!children[i].IsNull()) {
+			headers.insert({child_types[i].first, children[i].ToString()});
+		}
+	}
+	return headers;
+}
+
+// Build response Value from HttpResponseData
+static Value BuildHttpResponseFromData(const HttpResponseData &data) {
+	vector<Value> header_keys = data.header_keys;
+	vector<Value> header_values = data.header_values;
+	vector<Value> cookies = data.cookies;
+	return BuildHttpResponseValue(data.status_code, data.content_type, data.content_length, header_keys, header_values,
+	                              cookies, data.body);
+}
+
+// Parallel HTTP execution for scalar functions
+static void ExecuteHttpRequestsParallel(ClientContext &context, const vector<string> &urls, const string &method,
+                                        const vector<duckdb_httplib_openssl::Headers> &headers_list,
+                                        const vector<string> &bodies, const vector<string> &content_types,
+                                        vector<HttpResponseData> &results) {
+	idx_t count = urls.size();
+	results.resize(count);
+
+	if (count == 0) {
+		return;
+	}
+
+	// Extract settings from context (main thread only)
+	HttpSettings settings = ExtractHttpSettings(context, urls[0]);
+	idx_t max_concurrent = settings.max_concurrency;
+
+	// For single request or max_concurrent=1, execute sequentially
+	if (count == 1 || max_concurrent <= 1) {
+		for (idx_t i = 0; i < count; i++) {
+			results[i] =
+			    ExecuteHttpRequestThreadSafe(settings, urls[i], method, headers_list[i], bodies[i], content_types[i]);
+		}
+		return;
+	}
+
+	// Parallel execution
+	std::atomic<idx_t> next_idx {0};
+	idx_t num_threads = std::min(count, max_concurrent);
+	vector<std::thread> workers;
+
+	for (idx_t t = 0; t < num_threads; t++) {
+		workers.emplace_back([&]() {
+			while (true) {
+				idx_t i = next_idx.fetch_add(1);
+				if (i >= count) {
+					break;
+				}
+				results[i] = ExecuteHttpRequestThreadSafe(settings, urls[i], method, headers_list[i], bodies[i],
+				                                          content_types[i]);
+			}
+		});
+	}
+
+	for (auto &w : workers) {
+		w.join();
+	}
 }
 
 // Extract headers from STRUCT value (field names are header names, values are header values)
@@ -559,17 +817,23 @@ static void HttpHeadScalar1(DataChunk &args, ExpressionState &state, Vector &res
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string body;
-		PerformHttpRequestCore(context, url, "HEAD", Value(), status_code, content_type, content_length, header_keys,
-		                       header_values, cookies, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "HEAD", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -580,18 +844,24 @@ static void HttpHeadScalar2(DataChunk &args, ExpressionState &state, Vector &res
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto headers = headers_vec.GetValue(i);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string body;
-		PerformHttpRequestCore(context, url, "HEAD", headers, status_code, content_type, content_length, header_keys,
-		                       header_values, cookies, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "HEAD", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -603,20 +873,26 @@ static void HttpHeadScalar3(DataChunk &args, ExpressionState &state, Vector &res
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto headers = headers_vec.GetValue(i);
+		auto base_url = url_vec.GetValue(i).GetValue<string>();
 		auto params = params_vec.GetValue(i);
-		url = BuildUrlWithParams(url, params);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string body;
-		PerformHttpRequestCore(context, url, "HEAD", headers, status_code, content_type, content_length, header_keys,
-		                       header_values, cookies, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, body));
+		urls[i] = BuildUrlWithParams(base_url, params);
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "HEAD", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -648,17 +924,26 @@ static void HttpGetScalar1(DataChunk &args, ExpressionState &state, Vector &resu
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	// Collect all inputs
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string body;
-		PerformHttpRequestCore(context, url, "GET", Value(), status_code, content_type, content_length, header_keys,
-		                       header_values, cookies, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+	}
+
+	// Execute in parallel
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "GET", headers_list, bodies, content_types, results);
+
+	// Set results
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -669,18 +954,24 @@ static void HttpGetScalar2(DataChunk &args, ExpressionState &state, Vector &resu
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto headers = headers_vec.GetValue(i);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string body;
-		PerformHttpRequestCore(context, url, "GET", headers, status_code, content_type, content_length, header_keys,
-		                       header_values, cookies, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "GET", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -692,20 +983,26 @@ static void HttpGetScalar3(DataChunk &args, ExpressionState &state, Vector &resu
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
 		auto base_url = url_vec.GetValue(i).GetValue<string>();
-		auto headers = headers_vec.GetValue(i);
 		auto params = params_vec.GetValue(i);
-		auto url = BuildUrlWithParams(base_url, params);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string body;
-		PerformHttpRequestCore(context, url, "GET", headers, status_code, content_type, content_length, header_keys,
-		                       header_values, cookies, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, body));
+		urls[i] = BuildUrlWithParams(base_url, params);
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "GET", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -744,17 +1041,23 @@ static void HttpDeleteScalar1(DataChunk &args, ExpressionState &state, Vector &r
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string body;
-		PerformHttpRequestCore(context, url, "DELETE", Value(), status_code, content_type, content_length, header_keys,
-		                       header_values, cookies, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "DELETE", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -765,18 +1068,24 @@ static void HttpDeleteScalar2(DataChunk &args, ExpressionState &state, Vector &r
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto headers = headers_vec.GetValue(i);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string body;
-		PerformHttpRequestCore(context, url, "DELETE", headers, status_code, content_type, content_length, header_keys,
-		                       header_values, cookies, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "DELETE", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -788,20 +1097,26 @@ static void HttpDeleteScalar3(DataChunk &args, ExpressionState &state, Vector &r
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
 		auto base_url = url_vec.GetValue(i).GetValue<string>();
-		auto headers = headers_vec.GetValue(i);
 		auto params = params_vec.GetValue(i);
-		auto url = BuildUrlWithParams(base_url, params);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string body;
-		PerformHttpRequestCore(context, url, "DELETE", headers, status_code, content_type, content_length, header_keys,
-		                       header_values, cookies, body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, body));
+		urls[i] = BuildUrlWithParams(base_url, params);
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "DELETE", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -837,17 +1152,23 @@ static void HttpPostScalar1(DataChunk &args, ExpressionState &state, Vector &res
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count, "application/octet-stream");
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string response_body;
-		PerformHttpRequestCore(context, url, "POST", Value(), "", "application/octet-stream", status_code, content_type,
-		                       content_length, header_keys, header_values, cookies, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, response_body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "POST", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -858,18 +1179,24 @@ static void HttpPostScalar2(DataChunk &args, ExpressionState &state, Vector &res
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto headers = headers_vec.GetValue(i);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string response_body;
-		PerformHttpRequestCore(context, url, "POST", headers, "", "", status_code, content_type, content_length,
-		                       header_keys, header_values, cookies, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, response_body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "POST", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -881,20 +1208,26 @@ static void HttpPostScalar3(DataChunk &args, ExpressionState &state, Vector &res
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
 		auto base_url = url_vec.GetValue(i).GetValue<string>();
-		auto headers = headers_vec.GetValue(i);
 		auto params = params_vec.GetValue(i);
-		auto url = BuildUrlWithParams(base_url, params);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string response_body;
-		PerformHttpRequestCore(context, url, "POST", headers, "", "", status_code, content_type, content_length,
-		                       header_keys, header_values, cookies, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, response_body));
+		urls[i] = BuildUrlWithParams(base_url, params);
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "POST", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -930,17 +1263,23 @@ static void HttpPutScalar1(DataChunk &args, ExpressionState &state, Vector &resu
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count, "application/octet-stream");
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string response_body;
-		PerformHttpRequestCore(context, url, "PUT", Value(), "", "application/octet-stream", status_code, content_type,
-		                       content_length, header_keys, header_values, cookies, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, response_body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "PUT", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -951,18 +1290,24 @@ static void HttpPutScalar2(DataChunk &args, ExpressionState &state, Vector &resu
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto headers = headers_vec.GetValue(i);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string response_body;
-		PerformHttpRequestCore(context, url, "PUT", headers, "", "", status_code, content_type, content_length,
-		                       header_keys, header_values, cookies, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, response_body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "PUT", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -974,20 +1319,26 @@ static void HttpPutScalar3(DataChunk &args, ExpressionState &state, Vector &resu
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
 		auto base_url = url_vec.GetValue(i).GetValue<string>();
-		auto headers = headers_vec.GetValue(i);
 		auto params = params_vec.GetValue(i);
-		auto url = BuildUrlWithParams(base_url, params);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string response_body;
-		PerformHttpRequestCore(context, url, "PUT", headers, "", "", status_code, content_type, content_length,
-		                       header_keys, header_values, cookies, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, response_body));
+		urls[i] = BuildUrlWithParams(base_url, params);
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "PUT", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -1023,17 +1374,23 @@ static void HttpPatchScalar1(DataChunk &args, ExpressionState &state, Vector &re
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count, "application/octet-stream");
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string response_body;
-		PerformHttpRequestCore(context, url, "PATCH", Value(), "", "application/octet-stream", status_code,
-		                       content_type, content_length, header_keys, header_values, cookies, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, response_body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "PATCH", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -1044,18 +1401,24 @@ static void HttpPatchScalar2(DataChunk &args, ExpressionState &state, Vector &re
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto headers = headers_vec.GetValue(i);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string response_body;
-		PerformHttpRequestCore(context, url, "PATCH", headers, "", "", status_code, content_type, content_length,
-		                       header_keys, header_values, cookies, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, response_body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "PATCH", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -1067,20 +1430,26 @@ static void HttpPatchScalar3(DataChunk &args, ExpressionState &state, Vector &re
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count);
+
 	for (idx_t i = 0; i < count; i++) {
 		auto base_url = url_vec.GetValue(i).GetValue<string>();
-		auto headers = headers_vec.GetValue(i);
 		auto params = params_vec.GetValue(i);
-		auto url = BuildUrlWithParams(base_url, params);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string response_body;
-		PerformHttpRequestCore(context, url, "PATCH", headers, "", "", status_code, content_type, content_length,
-		                       header_keys, header_values, cookies, response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, response_body));
+		urls[i] = BuildUrlWithParams(base_url, params);
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "PATCH", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -1117,20 +1486,24 @@ static void HttpPostFormScalar2(DataChunk &args, ExpressionState &state, Vector 
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count, "application/x-www-form-urlencoded");
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto params = params_vec.GetValue(i);
-		auto form_body = BuildFormEncodedBody(params);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string response_body;
-		PerformHttpRequestCore(context, url, "POST", Value(), form_body, "application/x-www-form-urlencoded",
-		                       status_code, content_type, content_length, header_keys, header_values, cookies,
-		                       response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, response_body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+		bodies[i] = BuildFormEncodedBody(params_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "POST", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -1142,21 +1515,25 @@ static void HttpPostFormScalar3(DataChunk &args, ExpressionState &state, Vector 
 	auto count = args.size();
 	auto &context = state.GetContext();
 
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<string> bodies(count);
+	vector<string> content_types(count, "application/x-www-form-urlencoded");
+
 	for (idx_t i = 0; i < count; i++) {
-		auto url = url_vec.GetValue(i).GetValue<string>();
-		auto params = params_vec.GetValue(i);
-		auto headers = headers_vec.GetValue(i);
-		auto form_body = BuildFormEncodedBody(params);
-		int32_t status_code;
-		string content_type;
-		int64_t content_length;
-		vector<Value> header_keys, header_values, cookies;
-		string response_body;
-		PerformHttpRequestCore(context, url, "POST", headers, form_body, "application/x-www-form-urlencoded",
-		                       status_code, content_type, content_length, header_keys, header_values, cookies,
-		                       response_body);
-		result.SetValue(i, BuildHttpResponseValue(status_code, content_type, content_length, header_keys, header_values,
-		                                          cookies, response_body));
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+		bodies[i] = BuildFormEncodedBody(params_vec.GetValue(i));
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteHttpRequestsParallel(context, urls, "POST", headers_list, bodies, content_types, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
 }
 
@@ -1464,6 +1841,13 @@ static void HttpTableFunction(ClientContext &context, TableFunctionInput &data_p
 //------------------------------------------------------------------------------
 
 static void LoadInternal(ExtensionLoader &loader) {
+	// Register http_max_concurrency setting
+	auto &instance = loader.GetDatabaseInstance();
+	auto &config = DBConfig::GetConfig(instance);
+	config.AddExtensionOption("http_max_concurrency",
+	                          "Maximum number of concurrent HTTP requests per scalar function call (default: 32)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_HTTP_MAX_CONCURRENT));
+
 	auto http_response_type = CreateHttpResponseType();
 
 	// Register byte_range(offset, length) helper function
@@ -1477,23 +1861,31 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                      http_range_header_type, HttpRangeHeaderFunction, HttpRangeHeaderBind);
 	loader.RegisterFunction(http_range_header_func);
 
-	// Register http_head scalar functions
+	// Register http_head scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_head_scalar("http_head");
-	http_head_scalar.AddFunction(ScalarFunction({LogicalType::VARCHAR}, http_response_type, HttpHeadScalar1));
-	http_head_scalar.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpHeadScalar2));
+	ScalarFunction http_head_1({LogicalType::VARCHAR}, http_response_type, HttpHeadScalar1);
+	http_head_1.stability = FunctionStability::VOLATILE;
+	http_head_scalar.AddFunction(http_head_1);
+	ScalarFunction http_head_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpHeadScalar2);
+	http_head_2.stability = FunctionStability::VOLATILE;
+	http_head_scalar.AddFunction(http_head_2);
 	ScalarFunction http_head_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
 	                           HttpHeadScalar3, HttpHeadScalar3Bind);
+	http_head_3.stability = FunctionStability::VOLATILE;
 	http_head_scalar.AddFunction(http_head_3);
 	loader.RegisterFunction(http_head_scalar);
 
-	// Register http_get scalar functions
+	// Register http_get scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_get_scalar("http_get");
-	http_get_scalar.AddFunction(ScalarFunction({LogicalType::VARCHAR}, http_response_type, HttpGetScalar1));
-	http_get_scalar.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpGetScalar2));
+	ScalarFunction http_get_1({LogicalType::VARCHAR}, http_response_type, HttpGetScalar1);
+	http_get_1.stability = FunctionStability::VOLATILE;
+	http_get_scalar.AddFunction(http_get_1);
+	ScalarFunction http_get_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpGetScalar2);
+	http_get_2.stability = FunctionStability::VOLATILE;
+	http_get_scalar.AddFunction(http_get_2);
 	ScalarFunction http_get_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
 	                          HttpGetScalar3, HttpGetScalar3Bind);
+	http_get_3.stability = FunctionStability::VOLATILE;
 	http_get_scalar.AddFunction(http_get_3);
 	loader.RegisterFunction(http_get_scalar);
 
@@ -1511,13 +1903,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	http_get_table.named_parameters["params"] = LogicalType::ANY;
 	loader.RegisterFunction(http_get_table);
 
-	// Register http_delete scalar functions
+	// Register http_delete scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_delete_scalar("http_delete");
-	http_delete_scalar.AddFunction(ScalarFunction({LogicalType::VARCHAR}, http_response_type, HttpDeleteScalar1));
-	http_delete_scalar.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpDeleteScalar2));
+	ScalarFunction http_delete_1({LogicalType::VARCHAR}, http_response_type, HttpDeleteScalar1);
+	http_delete_1.stability = FunctionStability::VOLATILE;
+	http_delete_scalar.AddFunction(http_delete_1);
+	ScalarFunction http_delete_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpDeleteScalar2);
+	http_delete_2.stability = FunctionStability::VOLATILE;
+	http_delete_scalar.AddFunction(http_delete_2);
 	ScalarFunction http_delete_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
 	                             HttpDeleteScalar3, HttpDeleteScalar3Bind);
+	http_delete_3.stability = FunctionStability::VOLATILE;
 	http_delete_scalar.AddFunction(http_delete_3);
 	loader.RegisterFunction(http_delete_scalar);
 
@@ -1528,13 +1924,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	http_delete_table.named_parameters["params"] = LogicalType::ANY;
 	loader.RegisterFunction(http_delete_table);
 
-	// Register http_post scalar functions
+	// Register http_post scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_post_scalar("http_post");
-	http_post_scalar.AddFunction(ScalarFunction({LogicalType::VARCHAR}, http_response_type, HttpPostScalar1));
-	http_post_scalar.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPostScalar2));
+	ScalarFunction http_post_1({LogicalType::VARCHAR}, http_response_type, HttpPostScalar1);
+	http_post_1.stability = FunctionStability::VOLATILE;
+	http_post_scalar.AddFunction(http_post_1);
+	ScalarFunction http_post_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPostScalar2);
+	http_post_2.stability = FunctionStability::VOLATILE;
+	http_post_scalar.AddFunction(http_post_2);
 	ScalarFunction http_post_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
 	                           HttpPostScalar3, HttpPostScalar3Bind);
+	http_post_3.stability = FunctionStability::VOLATILE;
 	http_post_scalar.AddFunction(http_post_3);
 	loader.RegisterFunction(http_post_scalar);
 
@@ -1547,13 +1947,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	http_post_table.named_parameters["content_type"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(http_post_table);
 
-	// Register http_put scalar functions
+	// Register http_put scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_put_scalar("http_put");
-	http_put_scalar.AddFunction(ScalarFunction({LogicalType::VARCHAR}, http_response_type, HttpPutScalar1));
-	http_put_scalar.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPutScalar2));
+	ScalarFunction http_put_1({LogicalType::VARCHAR}, http_response_type, HttpPutScalar1);
+	http_put_1.stability = FunctionStability::VOLATILE;
+	http_put_scalar.AddFunction(http_put_1);
+	ScalarFunction http_put_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPutScalar2);
+	http_put_2.stability = FunctionStability::VOLATILE;
+	http_put_scalar.AddFunction(http_put_2);
 	ScalarFunction http_put_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
 	                          HttpPutScalar3, HttpPutScalar3Bind);
+	http_put_3.stability = FunctionStability::VOLATILE;
 	http_put_scalar.AddFunction(http_put_3);
 	loader.RegisterFunction(http_put_scalar);
 
@@ -1566,13 +1970,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	http_put_table.named_parameters["content_type"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(http_put_table);
 
-	// Register http_patch scalar functions
+	// Register http_patch scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_patch_scalar("http_patch");
-	http_patch_scalar.AddFunction(ScalarFunction({LogicalType::VARCHAR}, http_response_type, HttpPatchScalar1));
-	http_patch_scalar.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPatchScalar2));
+	ScalarFunction http_patch_1({LogicalType::VARCHAR}, http_response_type, HttpPatchScalar1);
+	http_patch_1.stability = FunctionStability::VOLATILE;
+	http_patch_scalar.AddFunction(http_patch_1);
+	ScalarFunction http_patch_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPatchScalar2);
+	http_patch_2.stability = FunctionStability::VOLATILE;
+	http_patch_scalar.AddFunction(http_patch_2);
 	ScalarFunction http_patch_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
 	                            HttpPatchScalar3, HttpPatchScalar3Bind);
+	http_patch_3.stability = FunctionStability::VOLATILE;
 	http_patch_scalar.AddFunction(http_patch_3);
 	loader.RegisterFunction(http_patch_scalar);
 
@@ -1585,12 +1993,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	http_patch_table.named_parameters["content_type"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(http_patch_table);
 
-	// Register http_post_form scalar functions (application/x-www-form-urlencoded)
+	// Register http_post_form scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_post_form_scalar("http_post_form");
-	http_post_form_scalar.AddFunction(
-	    ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPostFormScalar2));
+	ScalarFunction http_post_form_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPostFormScalar2);
+	http_post_form_2.stability = FunctionStability::VOLATILE;
+	http_post_form_scalar.AddFunction(http_post_form_2);
 	ScalarFunction http_post_form_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
 	                                HttpPostFormScalar3, HttpPostFormScalar3Bind);
+	http_post_form_3.stability = FunctionStability::VOLATILE;
 	http_post_form_scalar.AddFunction(http_post_form_3);
 	loader.RegisterFunction(http_post_form_scalar);
 
