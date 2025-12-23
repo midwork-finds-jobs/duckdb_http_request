@@ -1560,6 +1560,344 @@ static unique_ptr<FunctionData> HttpPostFormScalar3Bind(ClientContext &context, 
 }
 
 //------------------------------------------------------------------------------
+// MULTIPART FORM DATA FUNCTIONS
+//------------------------------------------------------------------------------
+
+// Convert DuckDB LIST of STRUCTs to MultipartFormDataItems
+// Expected struct: {name: VARCHAR, content: BLOB/VARCHAR, filename: VARCHAR (optional), content_type: VARCHAR
+// (optional)}
+static duckdb_httplib_openssl::MultipartFormDataItems ValueToMultipartItems(const Value &files_val,
+                                                                            const Value &fields_val) {
+	duckdb_httplib_openssl::MultipartFormDataItems items;
+
+	// Process files (LIST of STRUCTs)
+	if (!files_val.IsNull() && files_val.type().id() == LogicalTypeId::LIST) {
+		auto &file_list = ListValue::GetChildren(files_val);
+		for (auto &file_val : file_list) {
+			if (file_val.IsNull() || file_val.type().id() != LogicalTypeId::STRUCT) {
+				continue;
+			}
+
+			duckdb_httplib_openssl::MultipartFormData item;
+			auto &struct_type = file_val.type();
+			auto &child_types = StructType::GetChildTypes(struct_type);
+			auto &children = StructValue::GetChildren(file_val);
+
+			for (idx_t i = 0; i < child_types.size(); i++) {
+				if (children[i].IsNull()) {
+					continue;
+				}
+				string field_name = StringUtil::Lower(child_types[i].first);
+				if (field_name == "name") {
+					item.name = children[i].ToString();
+				} else if (field_name == "content") {
+					// Handle both BLOB and VARCHAR content
+					if (children[i].type().id() == LogicalTypeId::BLOB) {
+						auto blob = children[i].GetValueUnsafe<string_t>();
+						item.content = string(blob.GetData(), blob.GetSize());
+					} else {
+						item.content = children[i].ToString();
+					}
+				} else if (field_name == "filename") {
+					item.filename = children[i].ToString();
+				} else if (field_name == "content_type") {
+					item.content_type = children[i].ToString();
+				}
+			}
+
+			// Only add if name and content are provided
+			if (!item.name.empty() && !item.content.empty()) {
+				items.push_back(item);
+			}
+		}
+	}
+
+	// Process form fields (STRUCT)
+	if (!fields_val.IsNull() && fields_val.type().id() == LogicalTypeId::STRUCT) {
+		auto &struct_type = fields_val.type();
+		auto &child_types = StructType::GetChildTypes(struct_type);
+		auto &children = StructValue::GetChildren(fields_val);
+
+		for (idx_t i = 0; i < child_types.size(); i++) {
+			if (children[i].IsNull()) {
+				continue;
+			}
+			duckdb_httplib_openssl::MultipartFormData item;
+			item.name = child_types[i].first;
+			item.content = children[i].ToString();
+			// No filename = regular form field
+			items.push_back(item);
+		}
+	}
+
+	return items;
+}
+
+// Thread-safe multipart POST execution
+static HttpResponseData ExecuteMultipartPostThreadSafe(const HttpSettings &settings, const string &url,
+                                                       const duckdb_httplib_openssl::Headers &headers,
+                                                       const duckdb_httplib_openssl::MultipartFormDataItems &items) {
+	HttpResponseData result;
+	result.status_code = 0;
+	result.content_length = -1;
+
+	try {
+		string proto_host_port, path;
+		ParseUrl(url, proto_host_port, path);
+
+		duckdb_httplib_openssl::Client client(proto_host_port);
+		client.set_follow_location(true);
+		client.set_decompress(false);
+		client.enable_server_certificate_verification(false);
+
+		auto timeout_sec = static_cast<time_t>(settings.timeout);
+		client.set_read_timeout(timeout_sec, 0);
+		client.set_write_timeout(timeout_sec, 0);
+		client.set_connection_timeout(timeout_sec, 0);
+		client.set_keep_alive(settings.keep_alive);
+
+		if (!settings.proxy.empty()) {
+			string proxy_host;
+			idx_t proxy_port = 80;
+			string proxy_copy = settings.proxy;
+			HTTPUtil::ParseHTTPProxyHost(proxy_copy, proxy_host, proxy_port);
+			client.set_proxy(proxy_host, static_cast<int>(proxy_port));
+			if (!settings.proxy_username.empty()) {
+				client.set_proxy_basic_auth(settings.proxy_username, settings.proxy_password);
+			}
+		}
+
+		duckdb_httplib_openssl::Headers req_headers = headers;
+		if (req_headers.find("User-Agent") == req_headers.end()) {
+			req_headers.insert({"User-Agent", settings.user_agent});
+		}
+
+		// Execute multipart POST
+		auto res = client.Post(path, req_headers, items);
+
+		if (res.error() != duckdb_httplib_openssl::Error::Success) {
+			result.error = "HTTP multipart request failed: " + to_string(res.error());
+			return result;
+		}
+
+		result.status_code = res->status;
+		string response_body = res->body;
+
+		for (auto &header : res->headers) {
+			if (StringUtil::CIEquals(header.first, "Set-Cookie")) {
+				result.cookies.push_back(ParseSetCookieHeader(header.second));
+			} else {
+				if (StringUtil::CIEquals(header.first, "Content-Type")) {
+					result.content_type = header.second;
+				} else if (StringUtil::CIEquals(header.first, "Content-Length")) {
+					try {
+						result.content_length = std::stoll(header.second);
+					} catch (...) {
+					}
+				}
+				bool found = false;
+				for (idx_t i = 0; i < result.header_keys.size(); i++) {
+					if (StringUtil::CIEquals(result.header_keys[i].GetValue<string>(), header.first)) {
+						auto &values_list = result.header_values[i];
+						auto existing = ListValue::GetChildren(values_list);
+						existing.push_back(Value(header.second));
+						result.header_values[i] = Value::LIST(LogicalType::VARCHAR, existing);
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					result.header_keys.push_back(Value(header.first));
+					result.header_values.push_back(Value::LIST(LogicalType::VARCHAR, {Value(header.second)}));
+				}
+			}
+		}
+
+		result.body = response_body;
+
+		// Handle compression
+		try {
+			if (GZipFileSystem::CheckIsZip(response_body.data(), response_body.size())) {
+				result.body = GZipFileSystem::UncompressGZIPString(response_body);
+			} else if (CheckIsZstd(response_body.data(), response_body.size())) {
+				result.body = DecompressZstd(response_body);
+			}
+		} catch (...) {
+		}
+
+	} catch (std::exception &e) {
+		result.error = e.what();
+	}
+
+	return result;
+}
+
+// Parallel execution for multipart POST
+static void ExecuteMultipartPostParallel(ClientContext &context, const vector<string> &urls,
+                                         const vector<duckdb_httplib_openssl::Headers> &headers_list,
+                                         const vector<duckdb_httplib_openssl::MultipartFormDataItems> &items_list,
+                                         vector<HttpResponseData> &results) {
+	idx_t count = urls.size();
+	results.resize(count);
+
+	if (count == 0) {
+		return;
+	}
+
+	HttpSettings settings = ExtractHttpSettings(context, urls[0]);
+	idx_t max_concurrent = settings.max_concurrency;
+
+	if (count == 1 || max_concurrent <= 1) {
+		for (idx_t i = 0; i < count; i++) {
+			results[i] = ExecuteMultipartPostThreadSafe(settings, urls[i], headers_list[i], items_list[i]);
+		}
+		return;
+	}
+
+	std::atomic<idx_t> next_idx {0};
+	idx_t num_threads = std::min(count, max_concurrent);
+	vector<std::thread> workers;
+
+	for (idx_t t = 0; t < num_threads; t++) {
+		workers.emplace_back([&]() {
+			while (true) {
+				idx_t i = next_idx.fetch_add(1);
+				if (i >= count) {
+					break;
+				}
+				results[i] = ExecuteMultipartPostThreadSafe(settings, urls[i], headers_list[i], items_list[i]);
+			}
+		});
+	}
+
+	for (auto &w : workers) {
+		w.join();
+	}
+}
+
+// http_post_multipart(url, files)
+static void HttpPostMultipartScalar2(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &url_vec = args.data[0];
+	auto &files_vec = args.data[1];
+	auto count = args.size();
+	auto &context = state.GetContext();
+
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<duckdb_httplib_openssl::MultipartFormDataItems> items_list(count);
+
+	for (idx_t i = 0; i < count; i++) {
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+		items_list[i] = ValueToMultipartItems(files_vec.GetValue(i), Value());
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteMultipartPostParallel(context, urls, headers_list, items_list, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
+	}
+}
+
+// http_post_multipart(url, files, fields)
+static void HttpPostMultipartScalar3(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &url_vec = args.data[0];
+	auto &files_vec = args.data[1];
+	auto &fields_vec = args.data[2];
+	auto count = args.size();
+	auto &context = state.GetContext();
+
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<duckdb_httplib_openssl::MultipartFormDataItems> items_list(count);
+
+	for (idx_t i = 0; i < count; i++) {
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+		items_list[i] = ValueToMultipartItems(files_vec.GetValue(i), fields_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteMultipartPostParallel(context, urls, headers_list, items_list, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
+	}
+}
+
+// http_post_multipart(url, files, fields, headers)
+static void HttpPostMultipartScalar4(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &url_vec = args.data[0];
+	auto &files_vec = args.data[1];
+	auto &fields_vec = args.data[2];
+	auto &headers_vec = args.data[3];
+	auto count = args.size();
+	auto &context = state.GetContext();
+
+	vector<string> urls(count);
+	vector<duckdb_httplib_openssl::Headers> headers_list(count);
+	vector<duckdb_httplib_openssl::MultipartFormDataItems> items_list(count);
+
+	for (idx_t i = 0; i < count; i++) {
+		urls[i] = url_vec.GetValue(i).GetValue<string>();
+		items_list[i] = ValueToMultipartItems(files_vec.GetValue(i), fields_vec.GetValue(i));
+		headers_list[i] = ValueToHttplibHeaders(headers_vec.GetValue(i));
+	}
+
+	vector<HttpResponseData> results;
+	ExecuteMultipartPostParallel(context, urls, headers_list, items_list, results);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (!results[i].error.empty()) {
+			throw IOException(results[i].error);
+		}
+		result.SetValue(i, BuildHttpResponseFromData(results[i]));
+	}
+}
+
+// Bind function for http_post_multipart - allows named parameter reordering
+static unique_ptr<FunctionData> HttpPostMultipartScalarBind(ClientContext &context, ScalarFunction &bound_function,
+                                                            vector<unique_ptr<Expression>> &arguments) {
+	// Handle named parameter reordering for 3 and 4 arg versions
+	if (arguments.size() >= 3) {
+		// Map aliases to expected positions
+		idx_t files_idx = 1;
+		idx_t fields_idx = 2;
+		idx_t headers_idx = (arguments.size() == 4) ? 3 : -1;
+
+		for (idx_t i = 1; i < arguments.size(); i++) {
+			if (StringUtil::CIEquals(arguments[i]->alias, "files")) {
+				files_idx = i;
+			} else if (StringUtil::CIEquals(arguments[i]->alias, "fields")) {
+				fields_idx = i;
+			} else if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
+				headers_idx = i;
+			}
+		}
+
+		// Reorder if needed
+		if (arguments.size() == 3 && files_idx != 1) {
+			std::swap(arguments[1], arguments[files_idx == 2 ? 2 : 1]);
+		}
+		if (arguments.size() == 4) {
+			// Ensure order: url, files, fields, headers
+			vector<unique_ptr<Expression>> reordered;
+			reordered.push_back(std::move(arguments[0]));
+			reordered.push_back(std::move(arguments[files_idx]));
+			reordered.push_back(std::move(arguments[fields_idx]));
+			reordered.push_back(std::move(arguments[headers_idx]));
+			arguments = std::move(reordered);
+		}
+	}
+	return nullptr;
+}
+
+//------------------------------------------------------------------------------
 // TABLE FUNCTIONS (with named parameters)
 //------------------------------------------------------------------------------
 
@@ -1837,6 +2175,83 @@ static void HttpTableFunction(ClientContext &context, TableFunctionInput &data_p
 }
 
 //------------------------------------------------------------------------------
+// MULTIPART TABLE FUNCTION
+//------------------------------------------------------------------------------
+
+struct HttpMultipartTableBindData : public TableFunctionData {
+	string url;
+	Value files;
+	Value fields;
+	Value headers;
+};
+
+struct HttpMultipartTableState : public GlobalTableFunctionState {
+	bool done = false;
+};
+
+static unique_ptr<FunctionData> HttpPostMultipartTableBind(ClientContext &context, TableFunctionBindInput &input,
+                                                           vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<HttpMultipartTableBindData>();
+	result->url = input.inputs[0].GetValue<string>();
+	result->files = Value();
+	result->fields = Value();
+	result->headers = Value();
+
+	auto files_entry = input.named_parameters.find("files");
+	if (files_entry != input.named_parameters.end()) {
+		result->files = files_entry->second;
+	}
+
+	auto fields_entry = input.named_parameters.find("fields");
+	if (fields_entry != input.named_parameters.end()) {
+		result->fields = fields_entry->second;
+	}
+
+	auto headers_entry = input.named_parameters.find("headers");
+	if (headers_entry != input.named_parameters.end()) {
+		result->headers = headers_entry->second;
+	}
+
+	SetHttpReturnTypes(return_types, names);
+	return result;
+}
+
+static unique_ptr<GlobalTableFunctionState> HttpMultipartTableInit(ClientContext &context,
+                                                                   TableFunctionInitInput &input) {
+	return make_uniq<HttpMultipartTableState>();
+}
+
+static void HttpMultipartTableFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<HttpMultipartTableBindData>();
+	auto &state = data_p.global_state->Cast<HttpMultipartTableState>();
+
+	if (state.done) {
+		return;
+	}
+	state.done = true;
+
+	HttpSettings settings = ExtractHttpSettings(context, bind_data.url);
+	duckdb_httplib_openssl::Headers req_headers = ValueToHttplibHeaders(bind_data.headers);
+	auto items = ValueToMultipartItems(bind_data.files, bind_data.fields);
+
+	auto result = ExecuteMultipartPostThreadSafe(settings, bind_data.url, req_headers, items);
+
+	if (!result.error.empty()) {
+		throw IOException(result.error);
+	}
+
+	output.SetCardinality(1);
+	output.SetValue(0, 0, Value::INTEGER(result.status_code));
+	output.SetValue(1, 0, result.content_type.empty() ? Value(LogicalType::VARCHAR) : Value(result.content_type));
+	output.SetValue(2, 0,
+	                result.content_length < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(result.content_length));
+	output.SetValue(3, 0,
+	                Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, result.header_keys, result.header_values));
+	output.SetValue(4, 0, Value::LIST(CreateCookieStructType(), std::move(result.cookies)));
+	output.SetValue(5, 0, Value::BLOB_RAW(result.body));
+}
+
+//------------------------------------------------------------------------------
 // REGISTRATION
 //------------------------------------------------------------------------------
 
@@ -2010,6 +2425,33 @@ static void LoadInternal(ExtensionLoader &loader) {
 	http_post_form_table.named_parameters["headers"] = LogicalType::ANY;
 	http_post_form_table.named_parameters["params"] = LogicalType::ANY;
 	loader.RegisterFunction(http_post_form_table);
+
+	// Register http_post_multipart scalar functions (VOLATILE to prevent constant folding)
+	ScalarFunctionSet http_post_multipart_scalar("http_post_multipart");
+	// http_post_multipart(url, files)
+	ScalarFunction http_post_multipart_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type,
+	                                     HttpPostMultipartScalar2);
+	http_post_multipart_2.stability = FunctionStability::VOLATILE;
+	http_post_multipart_scalar.AddFunction(http_post_multipart_2);
+	// http_post_multipart(url, files, fields)
+	ScalarFunction http_post_multipart_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
+	                                     HttpPostMultipartScalar3, HttpPostMultipartScalarBind);
+	http_post_multipart_3.stability = FunctionStability::VOLATILE;
+	http_post_multipart_scalar.AddFunction(http_post_multipart_3);
+	// http_post_multipart(url, files, fields, headers)
+	ScalarFunction http_post_multipart_4({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY, LogicalType::ANY},
+	                                     http_response_type, HttpPostMultipartScalar4, HttpPostMultipartScalarBind);
+	http_post_multipart_4.stability = FunctionStability::VOLATILE;
+	http_post_multipart_scalar.AddFunction(http_post_multipart_4);
+	loader.RegisterFunction(http_post_multipart_scalar);
+
+	// Register http_post_multipart table function (with named parameters)
+	TableFunction http_post_multipart_table("http_post_multipart", {LogicalType::VARCHAR}, HttpMultipartTableFunction,
+	                                        HttpPostMultipartTableBind, HttpMultipartTableInit);
+	http_post_multipart_table.named_parameters["files"] = LogicalType::ANY;
+	http_post_multipart_table.named_parameters["fields"] = LogicalType::ANY;
+	http_post_multipart_table.named_parameters["headers"] = LogicalType::ANY;
+	loader.RegisterFunction(http_post_multipart_table);
 }
 
 void HttpRequestExtension::Load(ExtensionLoader &loader) {
