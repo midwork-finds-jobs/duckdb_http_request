@@ -127,7 +127,14 @@ static HttpSettings ExtractHttpSettings(ClientContext &context, const string &ur
 	secret_reader.TryGetSecretKey<string>("http_proxy_username", settings.proxy_username);
 	secret_reader.TryGetSecretKey<string>("http_proxy_password", settings.proxy_password);
 
-	settings.user_agent = StringUtil::Format("%s %s", config.UserAgent(), DuckDB::SourceID());
+	// Check for custom user agent setting, otherwise use default
+	string custom_user_agent;
+	if (FileOpener::TryGetCurrentSetting(&opener, "http_user_agent", custom_user_agent, &info) &&
+	    !custom_user_agent.empty()) {
+		settings.user_agent = custom_user_agent;
+	} else {
+		settings.user_agent = StringUtil::Format("%s %s", config.UserAgent(), DuckDB::SourceID());
+	}
 
 	return settings;
 }
@@ -2256,12 +2263,14 @@ static void HttpMultipartTableFunction(ClientContext &context, TableFunctionInpu
 //------------------------------------------------------------------------------
 
 static void LoadInternal(ExtensionLoader &loader) {
-	// Register http_max_concurrency setting
+	// Register extension settings
 	auto &instance = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(instance);
 	config.AddExtensionOption("http_max_concurrency",
 	                          "Maximum number of concurrent HTTP requests per scalar function call (default: 32)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_HTTP_MAX_CONCURRENT));
+	config.AddExtensionOption("http_user_agent", "Custom User-Agent header for all HTTP requests (default: DuckDB)",
+	                          LogicalType::VARCHAR, Value(""));
 
 	auto http_response_type = CreateHttpResponseType();
 
