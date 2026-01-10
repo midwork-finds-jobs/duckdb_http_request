@@ -22,8 +22,10 @@
 #include "zstd.h"
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -83,6 +85,7 @@ struct HttpSettings {
 	string proxy_password;
 	string user_agent;
 	uint64_t max_concurrency;
+	bool use_cache;
 };
 
 // Struct to hold HTTP response (for parallel collection)
@@ -97,6 +100,84 @@ struct HttpResponseData {
 	string error; // Non-empty if request failed
 };
 
+// Cache entry with timestamp
+struct HttpCacheEntry {
+	HttpResponseData response;
+	std::chrono::steady_clock::time_point timestamp;
+};
+
+// Global HTTP request cache to prevent duplicate requests within same query
+// Uses short TTL (1 second) to cache responses during query execution
+class HttpRequestCache {
+public:
+	static HttpRequestCache &Instance() {
+		static HttpRequestCache instance;
+		return instance;
+	}
+
+	// Generate cache key from request parameters (uses hashing for memory efficiency)
+	static string MakeKey(const string &url, const string &method, const duckdb_httplib_openssl::Headers &headers,
+	                      const string &body = "") {
+		// Hash headers to save memory (headers can be large)
+		std::hash<string> hasher;
+		size_t headers_hash = 0;
+		for (const auto &h : headers) {
+			headers_hash ^= hasher(h.first) + 0x9e3779b9 + (headers_hash << 6) + (headers_hash >> 2);
+			headers_hash ^= hasher(h.second) + 0x9e3779b9 + (headers_hash << 6) + (headers_hash >> 2);
+		}
+		// Hash body if present (body can be large for POST/PUT)
+		size_t body_hash = body.empty() ? 0 : hasher(body);
+		// Combine: method|url|headers_hash|body_hash
+		return method + "|" + url + "|" + std::to_string(headers_hash) + "|" + std::to_string(body_hash);
+	}
+
+	// Try to get cached response (returns true if found and not expired)
+	bool TryGet(const string &key, HttpResponseData &out) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		auto it = cache_.find(key);
+		if (it == cache_.end()) {
+			return false;
+		}
+		auto now = std::chrono::steady_clock::now();
+		auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.timestamp).count();
+		if (age_ms > TTL_MS) {
+			cache_.erase(it);
+			return false;
+		}
+		out = it->second.response;
+		return true;
+	}
+
+	// Store response in cache
+	void Put(const string &key, const HttpResponseData &response) {
+		std::lock_guard<std::mutex> lock(mutex_);
+		// Cleanup old entries periodically
+		if (cache_.size() > 1000) {
+			CleanupExpired();
+		}
+		cache_[key] = {response, std::chrono::steady_clock::now()};
+	}
+
+private:
+	HttpRequestCache() = default;
+
+	void CleanupExpired() {
+		auto now = std::chrono::steady_clock::now();
+		for (auto it = cache_.begin(); it != cache_.end();) {
+			auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.timestamp).count();
+			if (age_ms > TTL_MS) {
+				it = cache_.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+
+	static constexpr int64_t TTL_MS = 1000; // 1 second TTL
+	std::mutex mutex_;
+	std::unordered_map<string, HttpCacheEntry> cache_;
+};
+
 // Extract HTTP settings from context (call from main thread)
 static HttpSettings ExtractHttpSettings(ClientContext &context, const string &url) {
 	HttpSettings settings;
@@ -106,6 +187,7 @@ static HttpSettings ExtractHttpSettings(ClientContext &context, const string &ur
 	settings.timeout = 30;
 	settings.keep_alive = true;
 	settings.max_concurrency = DEFAULT_HTTP_MAX_CONCURRENT;
+	settings.use_cache = true;
 
 	ClientContextFileOpener opener(context);
 	FileOpenerInfo info;
@@ -114,6 +196,7 @@ static HttpSettings ExtractHttpSettings(ClientContext &context, const string &ur
 	FileOpener::TryGetCurrentSetting(&opener, "http_timeout", settings.timeout, &info);
 	FileOpener::TryGetCurrentSetting(&opener, "http_keep_alive", settings.keep_alive, &info);
 	FileOpener::TryGetCurrentSetting(&opener, "http_max_concurrency", settings.max_concurrency, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_request_cache", settings.use_cache, &info);
 
 	settings.proxy = config.options.http_proxy;
 	settings.proxy_username = config.options.http_proxy_username;
@@ -277,7 +360,7 @@ static Value BuildHttpResponseFromData(const HttpResponseData &data) {
 	                              cookies, data.body);
 }
 
-// Parallel HTTP execution for scalar functions
+// Parallel HTTP execution for scalar functions (with optional caching to prevent duplicate requests)
 static void ExecuteHttpRequestsParallel(ClientContext &context, const vector<string> &urls, const string &method,
                                         const vector<duckdb_httplib_openssl::Headers> &headers_list,
                                         const vector<string> &bodies, const vector<string> &content_types,
@@ -292,30 +375,59 @@ static void ExecuteHttpRequestsParallel(ClientContext &context, const vector<str
 	// Extract settings from context (main thread only)
 	HttpSettings settings = ExtractHttpSettings(context, urls[0]);
 	idx_t max_concurrent = settings.max_concurrency;
+	bool use_cache = settings.use_cache;
+	auto &cache = HttpRequestCache::Instance();
+
+	// Check cache first and collect indices that need fetching
+	vector<idx_t> to_fetch;
+	vector<string> cache_keys(count);
+
+	for (idx_t i = 0; i < count; i++) {
+		if (use_cache) {
+			cache_keys[i] = HttpRequestCache::MakeKey(urls[i], method, headers_list[i], bodies[i]);
+			if (cache.TryGet(cache_keys[i], results[i])) {
+				// Cache hit - result already populated
+				continue;
+			}
+		}
+		to_fetch.push_back(i);
+	}
+
+	if (to_fetch.empty()) {
+		// All results from cache
+		return;
+	}
 
 	// For single request or max_concurrent=1, execute sequentially
-	if (count == 1 || max_concurrent <= 1) {
-		for (idx_t i = 0; i < count; i++) {
+	if (to_fetch.size() == 1 || max_concurrent <= 1) {
+		for (idx_t i : to_fetch) {
 			results[i] =
 			    ExecuteHttpRequestThreadSafe(settings, urls[i], method, headers_list[i], bodies[i], content_types[i]);
+			if (use_cache) {
+				cache.Put(cache_keys[i], results[i]);
+			}
 		}
 		return;
 	}
 
 	// Parallel execution
 	std::atomic<idx_t> next_idx {0};
-	idx_t num_threads = std::min(count, max_concurrent);
+	idx_t num_threads = std::min(static_cast<idx_t>(to_fetch.size()), max_concurrent);
 	vector<std::thread> workers;
 
 	for (idx_t t = 0; t < num_threads; t++) {
-		workers.emplace_back([&]() {
+		workers.emplace_back([&, use_cache]() {
 			while (true) {
-				idx_t i = next_idx.fetch_add(1);
-				if (i >= count) {
+				idx_t fetch_idx = next_idx.fetch_add(1);
+				if (fetch_idx >= to_fetch.size()) {
 					break;
 				}
+				idx_t i = to_fetch[fetch_idx];
 				results[i] = ExecuteHttpRequestThreadSafe(settings, urls[i], method, headers_list[i], bodies[i],
 				                                          content_types[i]);
+				if (use_cache) {
+					cache.Put(cache_keys[i], results[i]);
+				}
 			}
 		});
 	}
@@ -2271,6 +2383,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_HTTP_MAX_CONCURRENT));
 	config.AddExtensionOption("http_user_agent", "Custom User-Agent header for all HTTP requests (default: DuckDB)",
 	                          LogicalType::VARCHAR, Value(""));
+	config.AddExtensionOption("http_request_cache",
+	                          "Cache HTTP responses within query to prevent duplicate requests (default: true)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	auto http_response_type = CreateHttpResponseType();
 
