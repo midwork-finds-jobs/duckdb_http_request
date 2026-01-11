@@ -334,20 +334,38 @@ static HttpResponseData ExecuteHttpRequestThreadSafe(const HttpSettings &setting
 	return result;
 }
 
-// Convert Value headers to httplib Headers
+// Convert Value headers to httplib Headers (supports both STRUCT and MAP)
 static duckdb_httplib_openssl::Headers ValueToHttplibHeaders(const Value &headers_val) {
 	duckdb_httplib_openssl::Headers headers;
 	if (headers_val.IsNull()) {
 		return headers;
 	}
-	auto &struct_type = headers_val.type();
-	auto &child_types = StructType::GetChildTypes(struct_type);
-	auto &children = StructValue::GetChildren(headers_val);
-	for (idx_t i = 0; i < child_types.size(); i++) {
-		if (!children[i].IsNull()) {
-			headers.insert({child_types[i].first, children[i].ToString()});
+
+	auto &type = headers_val.type();
+
+	// Handle MAP type: MAP {'key': 'value', ...}
+	if (type.id() == LogicalTypeId::MAP) {
+		auto &map_children = MapValue::GetChildren(headers_val);
+		for (auto &entry : map_children) {
+			auto &struct_children = StructValue::GetChildren(entry);
+			if (struct_children.size() >= 2 && !struct_children[0].IsNull() && !struct_children[1].IsNull()) {
+				headers.insert({struct_children[0].ToString(), struct_children[1].ToString()});
+			}
+		}
+		return headers;
+	}
+
+	// Handle STRUCT type: {key: 'value', ...}
+	if (type.id() == LogicalTypeId::STRUCT) {
+		auto &child_types = StructType::GetChildTypes(type);
+		auto &children = StructValue::GetChildren(headers_val);
+		for (idx_t i = 0; i < child_types.size(); i++) {
+			if (!children[i].IsNull()) {
+				headers.insert({child_types[i].first, children[i].ToString()});
+			}
 		}
 	}
+
 	return headers;
 }
 
