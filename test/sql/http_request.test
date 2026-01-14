@@ -210,3 +210,32 @@ true
 # Re-enable cache
 statement ok
 SET http_request_cache = true;
+
+#------------------------------------------------------------------------------
+# Case-insensitive header access
+#------------------------------------------------------------------------------
+
+# Headers are normalized to Title-Case (Content-Type, not content-type)
+query I
+SELECT http_get('https://example.com/').headers['Content-Type'] IS NOT NULL;
+----
+true
+
+# http_header() function for case-insensitive lookup
+query I
+SELECT http_header(http_get('https://example.com/'), 'content-type') IS NOT NULL;
+----
+true
+
+# http_header() works with any case
+query I
+SELECT http_header(http_get('https://example.com/'), 'CONTENT-TYPE') IS NOT NULL;
+----
+true
+
+# http_header() returns same value regardless of case
+query I
+SELECT http_header(r, 'content-type') = http_header(r, 'Content-Type')
+FROM (SELECT http_get('https://example.com/') as r);
+----
+true

@@ -101,6 +101,26 @@ struct HttpResponseData {
 	string error; // Non-empty if request failed
 };
 
+// Normalize HTTP header name to Title-Case (e.g., "content-type" -> "Content-Type")
+// Per HTTP convention, header names are case-insensitive but commonly written in Title-Case
+static string NormalizeHeaderName(const string &name) {
+	string result;
+	result.reserve(name.size());
+	bool capitalize_next = true;
+	for (char c : name) {
+		if (c == '-') {
+			result += c;
+			capitalize_next = true;
+		} else if (capitalize_next) {
+			result += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+			capitalize_next = false;
+		} else {
+			result += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		}
+	}
+	return result;
+}
+
 // Cache entry with timestamp
 struct HttpCacheEntry {
 	HttpResponseData response;
@@ -296,6 +316,7 @@ static HttpResponseData ExecuteHttpRequestThreadSafe(const HttpSettings &setting
 			if (StringUtil::CIEquals(header.first, "Set-Cookie")) {
 				result.cookies.push_back(ParseSetCookieHeader(header.second));
 			} else {
+				string normalized_key = NormalizeHeaderName(header.first);
 				if (StringUtil::CIEquals(header.first, "Content-Type")) {
 					result.content_type = header.second;
 				} else if (StringUtil::CIEquals(header.first, "Content-Length")) {
@@ -306,14 +327,14 @@ static HttpResponseData ExecuteHttpRequestThreadSafe(const HttpSettings &setting
 				}
 				bool found = false;
 				for (idx_t i = 0; i < result.header_keys.size(); i++) {
-					if (result.header_keys[i].GetValue<string>() == header.first) {
+					if (StringUtil::CIEquals(result.header_keys[i].GetValue<string>(), normalized_key)) {
 						result.header_values[i] = Value(header.second);
 						found = true;
 						break;
 					}
 				}
 				if (!found) {
-					result.header_keys.push_back(Value(header.first));
+					result.header_keys.push_back(Value(normalized_key));
 					result.header_values.push_back(Value(header.second));
 				}
 			}
@@ -804,6 +825,7 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 		if (StringUtil::CIEquals(header.first, "Set-Cookie")) {
 			cookies.push_back(ParseSetCookieHeader(header.second));
 		} else {
+			string normalized_key = NormalizeHeaderName(header.first);
 			// Extract convenience fields
 			if (StringUtil::CIEquals(header.first, "Content-Type")) {
 				resp_content_type = header.second;
@@ -818,14 +840,14 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 			// For duplicate non-cookie headers, last value wins
 			bool found = false;
 			for (idx_t i = 0; i < header_keys.size(); i++) {
-				if (header_keys[i].GetValue<string>() == header.first) {
+				if (StringUtil::CIEquals(header_keys[i].GetValue<string>(), normalized_key)) {
 					header_values[i] = Value(header.second);
 					found = true;
 					break;
 				}
 			}
 			if (!found) {
-				header_keys.push_back(Value(header.first));
+				header_keys.push_back(Value(normalized_key));
 				header_values.push_back(Value(header.second));
 			}
 		}
@@ -947,6 +969,55 @@ static LogicalType CreateHttpRangeHeaderType() {
 	child_list_t<LogicalType> struct_children;
 	struct_children.push_back(make_pair("Range", LogicalType::VARCHAR));
 	return LogicalType::STRUCT(std::move(struct_children));
+}
+
+// http_header(response, header_name) - Case-insensitive header lookup from HTTP response
+// Returns the header value or NULL if not found
+static void HttpHeaderFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &response_vec = args.data[0];
+	auto &header_name_vec = args.data[1];
+	auto count = args.size();
+
+	for (idx_t i = 0; i < count; i++) {
+		auto response_val = response_vec.GetValue(i);
+		auto header_name_val = header_name_vec.GetValue(i);
+
+		if (response_val.IsNull() || header_name_val.IsNull()) {
+			result.SetValue(i, Value(LogicalType::VARCHAR));
+			continue;
+		}
+
+		string header_name = header_name_val.GetValue<string>();
+
+		// Get the headers MAP from the response struct
+		auto &struct_children = StructValue::GetChildren(response_val);
+		// headers is at index 3 in the response struct (status, content_type, content_length, headers, ...)
+		auto &headers_map = struct_children[3];
+
+		if (headers_map.IsNull()) {
+			result.SetValue(i, Value(LogicalType::VARCHAR));
+			continue;
+		}
+
+		// Iterate through MAP entries for case-insensitive lookup
+		auto &map_children = MapValue::GetChildren(headers_map);
+		bool found = false;
+		for (auto &entry : map_children) {
+			auto &kv = StructValue::GetChildren(entry);
+			if (kv.size() >= 2 && !kv[0].IsNull()) {
+				string key = kv[0].GetValue<string>();
+				if (StringUtil::CIEquals(key, header_name)) {
+					result.SetValue(i, kv[1]);
+					found = true;
+					break;
+				}
+			}
+		}
+
+		if (!found) {
+			result.SetValue(i, Value(LogicalType::VARCHAR));
+		}
+	}
 }
 
 //------------------------------------------------------------------------------
@@ -1829,6 +1900,7 @@ static HttpResponseData ExecuteMultipartPostThreadSafe(const HttpSettings &setti
 			if (StringUtil::CIEquals(header.first, "Set-Cookie")) {
 				result.cookies.push_back(ParseSetCookieHeader(header.second));
 			} else {
+				string normalized_key = NormalizeHeaderName(header.first);
 				if (StringUtil::CIEquals(header.first, "Content-Type")) {
 					result.content_type = header.second;
 				} else if (StringUtil::CIEquals(header.first, "Content-Length")) {
@@ -1839,7 +1911,7 @@ static HttpResponseData ExecuteMultipartPostThreadSafe(const HttpSettings &setti
 				}
 				bool found = false;
 				for (idx_t i = 0; i < result.header_keys.size(); i++) {
-					if (StringUtil::CIEquals(result.header_keys[i].GetValue<string>(), header.first)) {
+					if (StringUtil::CIEquals(result.header_keys[i].GetValue<string>(), normalized_key)) {
 						auto &values_list = result.header_values[i];
 						auto existing = ListValue::GetChildren(values_list);
 						existing.push_back(Value(header.second));
@@ -1849,7 +1921,7 @@ static HttpResponseData ExecuteMultipartPostThreadSafe(const HttpSettings &setti
 					}
 				}
 				if (!found) {
-					result.header_keys.push_back(Value(header.first));
+					result.header_keys.push_back(Value(normalized_key));
 					result.header_values.push_back(Value::LIST(LogicalType::VARCHAR, {Value(header.second)}));
 				}
 			}
@@ -2424,6 +2496,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction http_range_header_func("http_range_header", {LogicalType::BIGINT, LogicalType::BIGINT},
 	                                      http_range_header_type, HttpRangeHeaderFunction, HttpRangeHeaderBind);
 	loader.RegisterFunction(http_range_header_func);
+
+	// Register http_header(response, header_name) - case-insensitive header lookup
+	ScalarFunction http_header_func("http_header", {http_response_type, LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	                                HttpHeaderFunction);
+	loader.RegisterFunction(http_header_func);
 
 	// Register http_head scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_head_scalar("http_head");

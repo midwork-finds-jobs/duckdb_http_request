@@ -86,7 +86,33 @@ SELECT http_get(
 -- Generate range string (for manual header construction)
 SELECT byte_range(727608633, 1278);
 -- Returns: 'bytes=727608633-727609910'
+
+-- Case-insensitive header lookup
+SELECT http_header(http_get('https://example.com/'), 'content-type');
+-- Works with any case: 'Content-Type', 'CONTENT-TYPE', 'content-type'
 ```
+
+### Header Access
+
+HTTP headers are case-insensitive per RFC 7230 (`Content-Type` = `content-type` = `CONTENT-TYPE`). However, DuckDB's MAP type uses case-sensitive key lookup. This extension solves this in two ways:
+
+**1. Header Normalization:** All response headers are normalized to Title-Case:
+
+```sql
+-- Headers like 'content-type' become 'Content-Type'
+SELECT headers['Content-Type'] FROM http_get('https://example.com/');
+```
+
+**2. Case-Insensitive Lookup:** Use `http_header()` for any-case access:
+
+```sql
+-- All of these return the same value
+SELECT http_header(response, 'content-type');
+SELECT http_header(response, 'Content-Type');
+SELECT http_header(response, 'CONTENT-TYPE');
+```
+
+**Note:** Direct MAP access (`headers['key']`) is case-sensitive - use Title-Case keys or the `http_header()` function.
 
 ## Configuration
 
