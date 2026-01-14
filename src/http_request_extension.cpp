@@ -876,9 +876,63 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 	                       resp_content_length, header_keys, header_values, cookies, final_body);
 }
 
-// Headers type: MAP(VARCHAR, VARCHAR) - single values, Set-Cookie handled separately
+///===--------------------------------------------------------------------===//
+// HTTP_HEADERS Extension Type
+//===--------------------------------------------------------------------===//
+// HTTP_HEADERS is an extension type wrapping MAP(VARCHAR, VARCHAR)
+// Keys are normalized to Title-Case for consistent access
+// The [] operator uses case-insensitive lookup via custom map_extract_value
+
+struct HttpHeadersType {
+	static LogicalType GetDefault() {
+		auto type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+		type.SetAlias("HTTP_HEADERS");
+		return type;
+	}
+};
+
+// Headers type: HTTP_HEADERS (MAP with Title-Case normalized keys)
 static LogicalType CreateHeadersMapType() {
-	return LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+	return HttpHeadersType::GetDefault();
+}
+
+// Case-insensitive map_extract_value for HTTP_HEADERS type
+// This enables headers['content-type'] to work regardless of case
+static void HttpHeadersExtractValue(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &headers_vec = args.data[0];
+	auto &key_vec = args.data[1];
+	auto count = args.size();
+
+	for (idx_t i = 0; i < count; i++) {
+		auto headers_val = headers_vec.GetValue(i);
+		auto key_val = key_vec.GetValue(i);
+
+		if (headers_val.IsNull() || key_val.IsNull()) {
+			result.SetValue(i, Value(LogicalType::VARCHAR));
+			continue;
+		}
+
+		string search_key = key_val.GetValue<string>();
+
+		// Iterate through MAP entries for case-insensitive lookup
+		auto &map_children = MapValue::GetChildren(headers_val);
+		bool found = false;
+		for (auto &entry : map_children) {
+			auto &kv = StructValue::GetChildren(entry);
+			if (kv.size() >= 2 && !kv[0].IsNull()) {
+				string key = kv[0].GetValue<string>();
+				if (StringUtil::CIEquals(key, search_key)) {
+					result.SetValue(i, kv[1]);
+					found = true;
+					break;
+				}
+			}
+		}
+
+		if (!found) {
+			result.SetValue(i, Value(LogicalType::VARCHAR));
+		}
+	}
 }
 
 // Build response STRUCT value
@@ -969,55 +1023,6 @@ static LogicalType CreateHttpRangeHeaderType() {
 	child_list_t<LogicalType> struct_children;
 	struct_children.push_back(make_pair("Range", LogicalType::VARCHAR));
 	return LogicalType::STRUCT(std::move(struct_children));
-}
-
-// http_header(response, header_name) - Case-insensitive header lookup from HTTP response
-// Returns the header value or NULL if not found
-static void HttpHeaderFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &response_vec = args.data[0];
-	auto &header_name_vec = args.data[1];
-	auto count = args.size();
-
-	for (idx_t i = 0; i < count; i++) {
-		auto response_val = response_vec.GetValue(i);
-		auto header_name_val = header_name_vec.GetValue(i);
-
-		if (response_val.IsNull() || header_name_val.IsNull()) {
-			result.SetValue(i, Value(LogicalType::VARCHAR));
-			continue;
-		}
-
-		string header_name = header_name_val.GetValue<string>();
-
-		// Get the headers MAP from the response struct
-		auto &struct_children = StructValue::GetChildren(response_val);
-		// headers is at index 3 in the response struct (status, content_type, content_length, headers, ...)
-		auto &headers_map = struct_children[3];
-
-		if (headers_map.IsNull()) {
-			result.SetValue(i, Value(LogicalType::VARCHAR));
-			continue;
-		}
-
-		// Iterate through MAP entries for case-insensitive lookup
-		auto &map_children = MapValue::GetChildren(headers_map);
-		bool found = false;
-		for (auto &entry : map_children) {
-			auto &kv = StructValue::GetChildren(entry);
-			if (kv.size() >= 2 && !kv[0].IsNull()) {
-				string key = kv[0].GetValue<string>();
-				if (StringUtil::CIEquals(key, header_name)) {
-					result.SetValue(i, kv[1]);
-					found = true;
-					break;
-				}
-			}
-		}
-
-		if (!found) {
-			result.SetValue(i, Value(LogicalType::VARCHAR));
-		}
-	}
 }
 
 //------------------------------------------------------------------------------
@@ -2497,10 +2502,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                      http_range_header_type, HttpRangeHeaderFunction, HttpRangeHeaderBind);
 	loader.RegisterFunction(http_range_header_func);
 
-	// Register http_header(response, header_name) - case-insensitive header lookup
-	ScalarFunction http_header_func("http_header", {http_response_type, LogicalType::VARCHAR}, LogicalType::VARCHAR,
-	                                HttpHeaderFunction);
-	loader.RegisterFunction(http_header_func);
+	// Register HTTP_HEADERS extension type
+	auto http_headers_type = HttpHeadersType::GetDefault();
+	loader.RegisterType("HTTP_HEADERS", http_headers_type);
+
+	// Register case-insensitive map_extract_value for HTTP_HEADERS type
+	// This enables headers['content-type'] to work regardless of case
+	ScalarFunction http_headers_extract("map_extract_value", {http_headers_type, LogicalType::VARCHAR},
+	                                    LogicalType::VARCHAR, HttpHeadersExtractValue);
+	loader.RegisterFunction(http_headers_extract);
 
 	// Register http_head scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_head_scalar("http_head");
