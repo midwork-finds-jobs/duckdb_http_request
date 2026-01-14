@@ -86,6 +86,7 @@ struct HttpSettings {
 	string user_agent;
 	uint64_t max_concurrency;
 	bool use_cache;
+	bool follow_redirects;
 };
 
 // Struct to hold HTTP response (for parallel collection)
@@ -188,6 +189,7 @@ static HttpSettings ExtractHttpSettings(ClientContext &context, const string &ur
 	settings.keep_alive = true;
 	settings.max_concurrency = DEFAULT_HTTP_MAX_CONCURRENT;
 	settings.use_cache = true;
+	settings.follow_redirects = true;
 
 	ClientContextFileOpener opener(context);
 	FileOpenerInfo info;
@@ -197,6 +199,7 @@ static HttpSettings ExtractHttpSettings(ClientContext &context, const string &ur
 	FileOpener::TryGetCurrentSetting(&opener, "http_keep_alive", settings.keep_alive, &info);
 	FileOpener::TryGetCurrentSetting(&opener, "http_max_concurrency", settings.max_concurrency, &info);
 	FileOpener::TryGetCurrentSetting(&opener, "http_request_cache", settings.use_cache, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_follow_redirects", settings.follow_redirects, &info);
 
 	settings.proxy = config.options.http_proxy;
 	settings.proxy_username = config.options.http_proxy_username;
@@ -236,7 +239,7 @@ static HttpResponseData ExecuteHttpRequestThreadSafe(const HttpSettings &setting
 		ParseUrl(url, proto_host_port, path);
 
 		duckdb_httplib_openssl::Client client(proto_host_port);
-		client.set_follow_location(true);
+		client.set_follow_location(settings.follow_redirects);
 		client.set_decompress(false);
 		client.enable_server_certificate_verification(false);
 
@@ -658,6 +661,7 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 	uint64_t http_timeout = 30;
 	uint64_t http_retries = 3;
 	bool http_keep_alive = true;
+	bool http_follow_redirects = true;
 
 	// Create file opener to read settings
 	ClientContextFileOpener opener(context);
@@ -668,6 +672,7 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 	FileOpener::TryGetCurrentSetting(&opener, "http_timeout", http_timeout, &info);
 	FileOpener::TryGetCurrentSetting(&opener, "http_retries", http_retries, &info);
 	FileOpener::TryGetCurrentSetting(&opener, "http_keep_alive", http_keep_alive, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_follow_redirects", http_follow_redirects, &info);
 
 	// Read proxy settings - first from secrets, then fall back to core settings
 	string http_proxy = config.options.http_proxy;
@@ -689,7 +694,7 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 
 	// Create httplib client with SSL support
 	duckdb_httplib_openssl::Client client(proto_host_port);
-	client.set_follow_location(true);
+	client.set_follow_location(http_follow_redirects);
 	client.set_decompress(false); // We handle decompression ourselves
 	client.enable_server_certificate_verification(false);
 
@@ -1783,7 +1788,7 @@ static HttpResponseData ExecuteMultipartPostThreadSafe(const HttpSettings &setti
 		ParseUrl(url, proto_host_port, path);
 
 		duckdb_httplib_openssl::Client client(proto_host_port);
-		client.set_follow_location(true);
+		client.set_follow_location(settings.follow_redirects);
 		client.set_decompress(false);
 		client.enable_server_certificate_verification(false);
 
@@ -2403,6 +2408,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::VARCHAR, Value(""));
 	config.AddExtensionOption("http_request_cache",
 	                          "Cache HTTP responses within query to prevent duplicate requests (default: true)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("http_follow_redirects", "Automatically follow HTTP redirects (default: true)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	auto http_response_type = CreateHttpResponseType();

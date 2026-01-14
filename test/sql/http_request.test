@@ -155,3 +155,58 @@ SELECT status IN (206, 503) FROM http_get(
 );
 ----
 true
+
+#------------------------------------------------------------------------------
+# http_follow_redirects setting
+#------------------------------------------------------------------------------
+
+# Disable cache to test redirect setting changes properly
+statement ok
+SET http_request_cache = false;
+
+# Default: follows redirects (httpbin may return 502, so allow status > 0)
+query I
+SELECT http_get('https://httpbin.org/redirect/1').status IN (200, 502);
+----
+true
+
+# Check setting exists and is default true
+query I
+SELECT current_setting('http_follow_redirects')::BOOLEAN;
+----
+true
+
+# Disable redirects: returns 302 with Location header
+statement ok
+SET http_follow_redirects = false;
+
+# Verify setting changed
+query I
+SELECT current_setting('http_follow_redirects')::BOOLEAN;
+----
+false
+
+# With redirects disabled, should return 302 (or 502 if httpbin has issues)
+query I
+SELECT http_get('https://httpbin.org/redirect/1').status IN (302, 502);
+----
+true
+
+# Location header should point to final destination (when not 502)
+query I
+SELECT http_get('https://httpbin.org/redirect/1').headers['Location'] IS NOT NULL OR http_get('https://httpbin.org/redirect/1').status = 502;
+----
+true
+
+# Re-enable redirects
+statement ok
+SET http_follow_redirects = true;
+
+query I
+SELECT http_get('https://httpbin.org/redirect/1').status IN (200, 502);
+----
+true
+
+# Re-enable cache
+statement ok
+SET http_request_cache = true;

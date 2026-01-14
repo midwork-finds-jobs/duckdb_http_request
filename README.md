@@ -117,6 +117,25 @@ SET http_retries = 3;            -- Number of retries (default: 3)
 SET http_keep_alive = true;      -- Keep connections alive (default: true)
 ```
 
+### Redirect Handling
+
+By default, HTTP redirects are followed automatically. Disable to track redirect chains:
+
+```sql
+-- Disable auto-follow to inspect redirects
+SET http_follow_redirects = false;
+
+-- Check redirect status and Location header
+SELECT
+    status,
+    headers['Location'] as redirect_url
+FROM http_get('https://example.com/short-link');
+-- Returns 301/302 with Location header
+
+-- Re-enable auto-follow (default)
+SET http_follow_redirects = true;
+```
+
 ## Response Handling
 
 ```sql
