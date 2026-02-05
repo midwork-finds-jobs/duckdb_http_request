@@ -20,6 +20,7 @@ jobs:
       ci_tools_version: main
       extension_name: http_request
 
+
   code-quality-check:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
@@ -27,5 +28,4 @@ jobs:
       duckdb_version: v1.4-andium
       ci_tools_version: main
       extension_name: http_request
-      # Skip tidy - httpfs dep doesn't support CLANG_TIDY conditional
-      format_checks: 'format'
+      format_checks: 'format;tidy'
