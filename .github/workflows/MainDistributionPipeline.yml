@@ -16,16 +16,16 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: v1.4-andium
+      duckdb_version: main
       ci_tools_version: main
       extension_name: http_request
+
 
   code-quality-check:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
-      duckdb_version: v1.4-andium
+      duckdb_version: main
       ci_tools_version: main
       extension_name: http_request
-      # Skip tidy - httpfs dep doesn't support CLANG_TIDY conditional
-      format_checks: 'format'
+      format_checks: 'format;tidy'
