@@ -221,9 +221,9 @@ static HttpSettings ExtractHttpSettings(ClientContext &context, const string &ur
 	FileOpener::TryGetCurrentSetting(&opener, "http_request_cache", settings.use_cache, &info);
 	FileOpener::TryGetCurrentSetting(&opener, "http_follow_redirects", settings.follow_redirects, &info);
 
-	settings.proxy = config.options.http_proxy;
-	settings.proxy_username = config.options.http_proxy_username;
-	settings.proxy_password = config.options.http_proxy_password;
+	FileOpener::TryGetCurrentSetting(&opener, "http_proxy", settings.proxy, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_proxy_username", settings.proxy_username, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_proxy_password", settings.proxy_password, &info);
 
 	KeyValueSecretReader secret_reader(opener, &info, "http");
 	string proxy_from_secret;
@@ -695,10 +695,13 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 	FileOpener::TryGetCurrentSetting(&opener, "http_keep_alive", http_keep_alive, &info);
 	FileOpener::TryGetCurrentSetting(&opener, "http_follow_redirects", http_follow_redirects, &info);
 
-	// Read proxy settings - first from secrets, then fall back to core settings
-	string http_proxy = config.options.http_proxy;
-	string http_proxy_username = config.options.http_proxy_username;
-	string http_proxy_password = config.options.http_proxy_password;
+	// Read proxy settings - first from generic settings, then fall back to secrets
+	string http_proxy;
+	string http_proxy_username;
+	string http_proxy_password;
+	FileOpener::TryGetCurrentSetting(&opener, "http_proxy", http_proxy, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_proxy_username", http_proxy_username, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_proxy_password", http_proxy_password, &info);
 
 	// Try reading proxy from secrets (httpfs style)
 	KeyValueSecretReader secret_reader(opener, &info, "http");
