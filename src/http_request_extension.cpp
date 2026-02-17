@@ -1788,7 +1788,7 @@ static unique_ptr<FunctionData> HttpPostFormScalar3Bind(ClientContext &context, 
 // Expected struct: {name: VARCHAR, content: BLOB/VARCHAR, filename: VARCHAR (optional), content_type: VARCHAR
 // (optional)}
 static duckdb_httplib_openssl::UploadFormDataItems ValueToMultipartItems(const Value &files_val,
-                                                                            const Value &fields_val) {
+                                                                         const Value &fields_val) {
 	duckdb_httplib_openssl::UploadFormDataItems items;
 
 	// Process files (LIST of STRUCTs)
@@ -1930,7 +1930,8 @@ static HttpResponseData ExecuteMultipartPostThreadSafe(const HttpSettings &setti
 				}
 				if (!found) {
 					result.header_keys.push_back(Value(normalized_key));
-					result.header_values.push_back(Value::LIST(LogicalType(LogicalTypeId::VARCHAR), vector<Value>{Value(header.second)}));
+					result.header_values.push_back(
+					    Value::LIST(LogicalType(LogicalTypeId::VARCHAR), vector<Value> {Value(header.second)}));
 				}
 			}
 		}

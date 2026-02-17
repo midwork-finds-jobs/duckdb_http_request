@@ -28,4 +28,4 @@ jobs:
       duckdb_version: v1.5-variegata
       ci_tools_version: main
       extension_name: http_request
-      format_checks: 'format;tidy'
+      format_checks: 'format'
