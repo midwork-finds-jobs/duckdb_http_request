@@ -9,5 +9,5 @@ duckdb_extension_load(http_request
 # Required extension for HTTP support - load from GitHub since it's out-of-tree now
 duckdb_extension_load(httpfs
     GIT_URL https://github.com/duckdb/duckdb-httpfs
-    GIT_TAG 7bd8c9c
+    GIT_TAG b4111098851b
 )

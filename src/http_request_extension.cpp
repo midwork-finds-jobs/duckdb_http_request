@@ -1784,12 +1784,12 @@ static unique_ptr<FunctionData> HttpPostFormScalar3Bind(ClientContext &context, 
 // MULTIPART FORM DATA FUNCTIONS
 //------------------------------------------------------------------------------
 
-// Convert DuckDB LIST of STRUCTs to MultipartFormDataItems
+// Convert DuckDB LIST of STRUCTs to UploadFormDataItems
 // Expected struct: {name: VARCHAR, content: BLOB/VARCHAR, filename: VARCHAR (optional), content_type: VARCHAR
 // (optional)}
-static duckdb_httplib_openssl::MultipartFormDataItems ValueToMultipartItems(const Value &files_val,
+static duckdb_httplib_openssl::UploadFormDataItems ValueToMultipartItems(const Value &files_val,
                                                                             const Value &fields_val) {
-	duckdb_httplib_openssl::MultipartFormDataItems items;
+	duckdb_httplib_openssl::UploadFormDataItems items;
 
 	// Process files (LIST of STRUCTs)
 	if (!files_val.IsNull() && files_val.type().id() == LogicalTypeId::LIST) {
@@ -1799,7 +1799,7 @@ static duckdb_httplib_openssl::MultipartFormDataItems ValueToMultipartItems(cons
 				continue;
 			}
 
-			duckdb_httplib_openssl::MultipartFormData item;
+			duckdb_httplib_openssl::UploadFormData item;
 			auto &struct_type = file_val.type();
 			auto &child_types = StructType::GetChildTypes(struct_type);
 			auto &children = StructValue::GetChildren(file_val);
@@ -1843,7 +1843,7 @@ static duckdb_httplib_openssl::MultipartFormDataItems ValueToMultipartItems(cons
 			if (children[i].IsNull()) {
 				continue;
 			}
-			duckdb_httplib_openssl::MultipartFormData item;
+			duckdb_httplib_openssl::UploadFormData item;
 			item.name = child_types[i].first;
 			item.content = children[i].ToString();
 			// No filename = regular form field
@@ -1857,7 +1857,7 @@ static duckdb_httplib_openssl::MultipartFormDataItems ValueToMultipartItems(cons
 // Thread-safe multipart POST execution
 static HttpResponseData ExecuteMultipartPostThreadSafe(const HttpSettings &settings, const string &url,
                                                        const duckdb_httplib_openssl::Headers &headers,
-                                                       const duckdb_httplib_openssl::MultipartFormDataItems &items) {
+                                                       const duckdb_httplib_openssl::UploadFormDataItems &items) {
 	HttpResponseData result;
 	result.status_code = 0;
 	result.content_length = -1;
@@ -1930,7 +1930,7 @@ static HttpResponseData ExecuteMultipartPostThreadSafe(const HttpSettings &setti
 				}
 				if (!found) {
 					result.header_keys.push_back(Value(normalized_key));
-					result.header_values.push_back(Value::LIST(LogicalType::VARCHAR, {Value(header.second)}));
+					result.header_values.push_back(Value::LIST(LogicalType(LogicalTypeId::VARCHAR), vector<Value>{Value(header.second)}));
 				}
 			}
 		}
@@ -1957,7 +1957,7 @@ static HttpResponseData ExecuteMultipartPostThreadSafe(const HttpSettings &setti
 // Parallel execution for multipart POST
 static void ExecuteMultipartPostParallel(ClientContext &context, const vector<string> &urls,
                                          const vector<duckdb_httplib_openssl::Headers> &headers_list,
-                                         const vector<duckdb_httplib_openssl::MultipartFormDataItems> &items_list,
+                                         const vector<duckdb_httplib_openssl::UploadFormDataItems> &items_list,
                                          vector<HttpResponseData> &results) {
 	idx_t count = urls.size();
 	results.resize(count);
@@ -2006,7 +2006,7 @@ static void HttpPostMultipartScalar2(DataChunk &args, ExpressionState &state, Ve
 
 	vector<string> urls(count);
 	vector<duckdb_httplib_openssl::Headers> headers_list(count);
-	vector<duckdb_httplib_openssl::MultipartFormDataItems> items_list(count);
+	vector<duckdb_httplib_openssl::UploadFormDataItems> items_list(count);
 
 	for (idx_t i = 0; i < count; i++) {
 		urls[i] = url_vec.GetValue(i).GetValue<string>();
@@ -2034,7 +2034,7 @@ static void HttpPostMultipartScalar3(DataChunk &args, ExpressionState &state, Ve
 
 	vector<string> urls(count);
 	vector<duckdb_httplib_openssl::Headers> headers_list(count);
-	vector<duckdb_httplib_openssl::MultipartFormDataItems> items_list(count);
+	vector<duckdb_httplib_openssl::UploadFormDataItems> items_list(count);
 
 	for (idx_t i = 0; i < count; i++) {
 		urls[i] = url_vec.GetValue(i).GetValue<string>();
@@ -2063,7 +2063,7 @@ static void HttpPostMultipartScalar4(DataChunk &args, ExpressionState &state, Ve
 
 	vector<string> urls(count);
 	vector<duckdb_httplib_openssl::Headers> headers_list(count);
-	vector<duckdb_httplib_openssl::MultipartFormDataItems> items_list(count);
+	vector<duckdb_httplib_openssl::UploadFormDataItems> items_list(count);
 
 	for (idx_t i = 0; i < count; i++) {
 		urls[i] = url_vec.GetValue(i).GetValue<string>();
