@@ -2195,7 +2195,8 @@ struct HttpMultipartTableState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> HttpPostMultipartTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                                           vector<LogicalType> &return_types, vector<Identifier> &names) {
+                                                           vector<LogicalType> &return_types,
+                                                           vector<Identifier> &names) {
 	auto result = make_uniq<HttpMultipartTableBindData>();
 	result->url = input.inputs[0].GetValue<string>();
 	result->files = Value();
@@ -2284,7 +2285,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register http_range_header(offset, length) helper function - returns STRUCT for headers parameter
 	auto http_range_header_type = CreateHttpRangeHeaderType();
-	ScalarFunction http_range_header_func("http_range_header", {{"offset", LogicalType::BIGINT}, {"length", LogicalType::BIGINT}},
+	ScalarFunction http_range_header_func("http_range_header",
+	                                      {{"offset", LogicalType::BIGINT}, {"length", LogicalType::BIGINT}},
 	                                      http_range_header_type, HttpRangeHeaderFunction);
 	loader.RegisterFunction(http_range_header_func);
 
@@ -2303,11 +2305,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction http_head_1({LogicalType::VARCHAR}, http_response_type, HttpHeadScalar1);
 	http_head_1.SetVolatile();
 	http_head_scalar.AddFunction(http_head_1);
-	ScalarFunction http_head_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type, HttpHeadScalar2);
+	ScalarFunction http_head_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
+	                           HttpHeadScalar2);
 	http_head_2.SetVolatile();
 	http_head_scalar.AddFunction(http_head_2);
-	ScalarFunction http_head_3({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}}, http_response_type,
-	                           HttpHeadScalar3);
+	ScalarFunction http_head_3(
+	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
+	    http_response_type, HttpHeadScalar3);
 	http_head_3.SetVolatile();
 	http_head_scalar.AddFunction(http_head_3);
 	loader.RegisterFunction(http_head_scalar);
@@ -2317,11 +2321,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction http_get_1({LogicalType::VARCHAR}, http_response_type, HttpGetScalar1);
 	http_get_1.SetVolatile();
 	http_get_scalar.AddFunction(http_get_1);
-	ScalarFunction http_get_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type, HttpGetScalar2);
+	ScalarFunction http_get_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
+	                          HttpGetScalar2);
 	http_get_2.SetVolatile();
 	http_get_scalar.AddFunction(http_get_2);
-	ScalarFunction http_get_3({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}}, http_response_type,
-	                          HttpGetScalar3);
+	ScalarFunction http_get_3(
+	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
+	    http_response_type, HttpGetScalar3);
 	http_get_3.SetVolatile();
 	http_get_scalar.AddFunction(http_get_3);
 	loader.RegisterFunction(http_get_scalar);
@@ -2329,15 +2335,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register http_head table function (with named parameters)
 	TableFunction http_head_table("http_head", {LogicalType::VARCHAR}, HttpTableFunction, HttpHeadTableBind,
 	                              HttpTableInit);
-	http_head_table.GetSignature().WithTypedKwargs(
-	    "options", [](TypedKwargs &options) { options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY); });
+	http_head_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY);
+	});
 	loader.RegisterFunction(http_head_table);
 
 	// Register http_get table function (with named parameters)
 	TableFunction http_get_table("http_get", {LogicalType::VARCHAR}, HttpTableFunction, HttpGetTableBind,
 	                             HttpTableInit);
-	http_get_table.GetSignature().WithTypedKwargs(
-	    "options", [](TypedKwargs &options) { options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY); });
+	http_get_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY);
+	});
 	loader.RegisterFunction(http_get_table);
 
 	// Register http_delete scalar functions (VOLATILE to prevent constant folding)
@@ -2345,11 +2353,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction http_delete_1({LogicalType::VARCHAR}, http_response_type, HttpDeleteScalar1);
 	http_delete_1.SetVolatile();
 	http_delete_scalar.AddFunction(http_delete_1);
-	ScalarFunction http_delete_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type, HttpDeleteScalar2);
+	ScalarFunction http_delete_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
+	                             HttpDeleteScalar2);
 	http_delete_2.SetVolatile();
 	http_delete_scalar.AddFunction(http_delete_2);
-	ScalarFunction http_delete_3({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}}, http_response_type,
-	                             HttpDeleteScalar3);
+	ScalarFunction http_delete_3(
+	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
+	    http_response_type, HttpDeleteScalar3);
 	http_delete_3.SetVolatile();
 	http_delete_scalar.AddFunction(http_delete_3);
 	loader.RegisterFunction(http_delete_scalar);
@@ -2357,8 +2367,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register http_delete table function (with named parameters)
 	TableFunction http_delete_table("http_delete", {LogicalType::VARCHAR}, HttpTableFunction, HttpDeleteTableBind,
 	                                HttpTableInit);
-	http_delete_table.GetSignature().WithTypedKwargs(
-	    "options", [](TypedKwargs &options) { options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY); });
+	http_delete_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY);
+	});
 	loader.RegisterFunction(http_delete_table);
 
 	// Register http_post scalar functions (VOLATILE to prevent constant folding)
@@ -2366,11 +2377,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction http_post_1({LogicalType::VARCHAR}, http_response_type, HttpPostScalar1);
 	http_post_1.SetVolatile();
 	http_post_scalar.AddFunction(http_post_1);
-	ScalarFunction http_post_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type, HttpPostScalar2);
+	ScalarFunction http_post_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
+	                           HttpPostScalar2);
 	http_post_2.SetVolatile();
 	http_post_scalar.AddFunction(http_post_2);
-	ScalarFunction http_post_3({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}}, http_response_type,
-	                           HttpPostScalar3);
+	ScalarFunction http_post_3(
+	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
+	    http_response_type, HttpPostScalar3);
 	http_post_3.SetVolatile();
 	http_post_scalar.AddFunction(http_post_3);
 	loader.RegisterFunction(http_post_scalar);
@@ -2378,8 +2391,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register http_post table function (with named parameters)
 	TableFunction http_post_table("http_post", {LogicalType::VARCHAR}, HttpTableFunction, HttpPostTableBind,
 	                              HttpTableInit);
-	http_post_table.GetSignature().WithTypedKwargs(
-	    "options", [](TypedKwargs &options) { options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY).Add("body", LogicalType::BLOB).Add("content_type", LogicalType::VARCHAR); });
+	http_post_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY)
+		    .Add("params", LogicalType::ANY)
+		    .Add("body", LogicalType::BLOB)
+		    .Add("content_type", LogicalType::VARCHAR);
+	});
 	loader.RegisterFunction(http_post_table);
 
 	// Register http_put scalar functions (VOLATILE to prevent constant folding)
@@ -2387,11 +2404,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction http_put_1({LogicalType::VARCHAR}, http_response_type, HttpPutScalar1);
 	http_put_1.SetVolatile();
 	http_put_scalar.AddFunction(http_put_1);
-	ScalarFunction http_put_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type, HttpPutScalar2);
+	ScalarFunction http_put_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
+	                          HttpPutScalar2);
 	http_put_2.SetVolatile();
 	http_put_scalar.AddFunction(http_put_2);
-	ScalarFunction http_put_3({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}}, http_response_type,
-	                          HttpPutScalar3);
+	ScalarFunction http_put_3(
+	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
+	    http_response_type, HttpPutScalar3);
 	http_put_3.SetVolatile();
 	http_put_scalar.AddFunction(http_put_3);
 	loader.RegisterFunction(http_put_scalar);
@@ -2399,8 +2418,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register http_put table function (with named parameters)
 	TableFunction http_put_table("http_put", {LogicalType::VARCHAR}, HttpTableFunction, HttpPutTableBind,
 	                             HttpTableInit);
-	http_put_table.GetSignature().WithTypedKwargs(
-	    "options", [](TypedKwargs &options) { options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY).Add("body", LogicalType::BLOB).Add("content_type", LogicalType::VARCHAR); });
+	http_put_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY)
+		    .Add("params", LogicalType::ANY)
+		    .Add("body", LogicalType::BLOB)
+		    .Add("content_type", LogicalType::VARCHAR);
+	});
 	loader.RegisterFunction(http_put_table);
 
 	// Register http_patch scalar functions (VOLATILE to prevent constant folding)
@@ -2408,11 +2431,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction http_patch_1({LogicalType::VARCHAR}, http_response_type, HttpPatchScalar1);
 	http_patch_1.SetVolatile();
 	http_patch_scalar.AddFunction(http_patch_1);
-	ScalarFunction http_patch_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type, HttpPatchScalar2);
+	ScalarFunction http_patch_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
+	                            HttpPatchScalar2);
 	http_patch_2.SetVolatile();
 	http_patch_scalar.AddFunction(http_patch_2);
-	ScalarFunction http_patch_3({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}}, http_response_type,
-	                            HttpPatchScalar3);
+	ScalarFunction http_patch_3(
+	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
+	    http_response_type, HttpPatchScalar3);
 	http_patch_3.SetVolatile();
 	http_patch_scalar.AddFunction(http_patch_3);
 	loader.RegisterFunction(http_patch_scalar);
@@ -2420,17 +2445,23 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register http_patch table function (with named parameters)
 	TableFunction http_patch_table("http_patch", {LogicalType::VARCHAR}, HttpTableFunction, HttpPatchTableBind,
 	                               HttpTableInit);
-	http_patch_table.GetSignature().WithTypedKwargs(
-	    "options", [](TypedKwargs &options) { options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY).Add("body", LogicalType::BLOB).Add("content_type", LogicalType::VARCHAR); });
+	http_patch_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY)
+		    .Add("params", LogicalType::ANY)
+		    .Add("body", LogicalType::BLOB)
+		    .Add("content_type", LogicalType::VARCHAR);
+	});
 	loader.RegisterFunction(http_patch_table);
 
 	// Register http_post_form scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_post_form_scalar("http_post_form");
-	ScalarFunction http_post_form_2({{"url", LogicalType::VARCHAR}, {"params", LogicalType::ANY}}, http_response_type, HttpPostFormScalar2);
+	ScalarFunction http_post_form_2({{"url", LogicalType::VARCHAR}, {"params", LogicalType::ANY}}, http_response_type,
+	                                HttpPostFormScalar2);
 	http_post_form_2.SetVolatile();
 	http_post_form_scalar.AddFunction(http_post_form_2);
-	ScalarFunction http_post_form_3({{"url", LogicalType::VARCHAR}, {"params", LogicalType::ANY}, {"headers", LogicalType::ANY}}, http_response_type,
-	                                HttpPostFormScalar3);
+	ScalarFunction http_post_form_3(
+	    {{"url", LogicalType::VARCHAR}, {"params", LogicalType::ANY}, {"headers", LogicalType::ANY}},
+	    http_response_type, HttpPostFormScalar3);
 	http_post_form_3.SetVolatile();
 	http_post_form_scalar.AddFunction(http_post_form_3);
 	loader.RegisterFunction(http_post_form_scalar);
@@ -2438,24 +2469,29 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register http_post_form table function (with named parameters)
 	TableFunction http_post_form_table("http_post_form", {LogicalType::VARCHAR}, HttpTableFunction,
 	                                   HttpPostFormTableBind, HttpTableInit);
-	http_post_form_table.GetSignature().WithTypedKwargs(
-	    "options", [](TypedKwargs &options) { options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY); });
+	http_post_form_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY);
+	});
 	loader.RegisterFunction(http_post_form_table);
 
 	// Register http_post_multipart scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_post_multipart_scalar("http_post_multipart");
 	// http_post_multipart(url, files)
-	ScalarFunction http_post_multipart_2({{"url", LogicalType::VARCHAR}, {"files", LogicalType::ANY}}, http_response_type,
-	                                     HttpPostMultipartScalar2);
+	ScalarFunction http_post_multipart_2({{"url", LogicalType::VARCHAR}, {"files", LogicalType::ANY}},
+	                                     http_response_type, HttpPostMultipartScalar2);
 	http_post_multipart_2.SetVolatile();
 	http_post_multipart_scalar.AddFunction(http_post_multipart_2);
 	// http_post_multipart(url, files, fields)
-	ScalarFunction http_post_multipart_3({{"url", LogicalType::VARCHAR}, {"files", LogicalType::ANY}, {"fields", LogicalType::ANY}}, http_response_type,
-	                                     HttpPostMultipartScalar3);
+	ScalarFunction http_post_multipart_3(
+	    {{"url", LogicalType::VARCHAR}, {"files", LogicalType::ANY}, {"fields", LogicalType::ANY}}, http_response_type,
+	    HttpPostMultipartScalar3);
 	http_post_multipart_3.SetVolatile();
 	http_post_multipart_scalar.AddFunction(http_post_multipart_3);
 	// http_post_multipart(url, files, fields, headers)
-	ScalarFunction http_post_multipart_4({{"url", LogicalType::VARCHAR}, {"files", LogicalType::ANY}, {"fields", LogicalType::ANY}, {"headers", LogicalType::ANY}},
+	ScalarFunction http_post_multipart_4({{"url", LogicalType::VARCHAR},
+	                                      {"files", LogicalType::ANY},
+	                                      {"fields", LogicalType::ANY},
+	                                      {"headers", LogicalType::ANY}},
 	                                     http_response_type, HttpPostMultipartScalar4);
 	http_post_multipart_4.SetVolatile();
 	http_post_multipart_scalar.AddFunction(http_post_multipart_4);
@@ -2464,8 +2500,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register http_post_multipart table function (with named parameters)
 	TableFunction http_post_multipart_table("http_post_multipart", {LogicalType::VARCHAR}, HttpMultipartTableFunction,
 	                                        HttpPostMultipartTableBind, HttpMultipartTableInit);
-	http_post_multipart_table.GetSignature().WithTypedKwargs(
-	    "options", [](TypedKwargs &options) { options.Add("files", LogicalType::ANY).Add("fields", LogicalType::ANY).Add("headers", LogicalType::ANY); });
+	http_post_multipart_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("files", LogicalType::ANY).Add("fields", LogicalType::ANY).Add("headers", LogicalType::ANY);
+	});
 	loader.RegisterFunction(http_post_multipart_table);
 }
 

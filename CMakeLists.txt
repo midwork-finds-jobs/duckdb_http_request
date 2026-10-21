@@ -28,6 +28,15 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 if(NOT CLANG_TIDY)
   target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
   target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+  # httplib loads system certs from the macOS keychain
+  if(APPLE)
+    find_library(COREFOUNDATION_FRAMEWORK CoreFoundation)
+    find_library(SECURITY_FRAMEWORK Security)
+    target_link_libraries(${EXTENSION_NAME} ${COREFOUNDATION_FRAMEWORK}
+                          ${SECURITY_FRAMEWORK})
+    target_link_libraries(${LOADABLE_EXTENSION_NAME}
+                          ${COREFOUNDATION_FRAMEWORK} ${SECURITY_FRAMEWORK})
+  endif()
 endif()
 
 install(
