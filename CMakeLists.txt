@@ -5,8 +5,8 @@ set(TARGET_NAME http_request)
 
 project(${TARGET_NAME})
 
-# OpenSSL is needed for HTTPS support via httplib
-# For clang-tidy checks, we make it optional as it's not needed for static analysis
+# OpenSSL is needed for HTTPS support via httplib For clang-tidy checks, we make
+# it optional as it's not needed for static analysis
 if(CLANG_TIDY)
   find_package(OpenSSL)
 else()
