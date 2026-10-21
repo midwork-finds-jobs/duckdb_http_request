@@ -221,9 +221,9 @@ static HttpSettings ExtractHttpSettings(ClientContext &context, const string &ur
 	FileOpener::TryGetCurrentSetting(&opener, "http_request_cache", settings.use_cache, &info);
 	FileOpener::TryGetCurrentSetting(&opener, "http_follow_redirects", settings.follow_redirects, &info);
 
-	settings.proxy = config.options.http_proxy;
-	settings.proxy_username = config.options.http_proxy_username;
-	settings.proxy_password = config.options.http_proxy_password;
+	FileOpener::TryGetCurrentSetting(&opener, "http_proxy", settings.proxy, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_proxy_username", settings.proxy_username, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_proxy_password", settings.proxy_password, &info);
 
 	KeyValueSecretReader secret_reader(opener, &info, "http");
 	string proxy_from_secret;
@@ -385,7 +385,7 @@ static duckdb_httplib_openssl::Headers ValueToHttplibHeaders(const Value &header
 		auto &children = StructValue::GetChildren(headers_val);
 		for (idx_t i = 0; i < child_types.size(); i++) {
 			if (!children[i].IsNull()) {
-				headers.insert({child_types[i].first, children[i].ToString()});
+				headers.insert({child_types[i].first.GetIdentifierName(), children[i].ToString()});
 			}
 		}
 	}
@@ -490,7 +490,7 @@ static void ExtractHeaders(const Value &headers_val, HTTPHeaders &req_headers) {
 
 	for (idx_t i = 0; i < child_types.size(); i++) {
 		if (!children[i].IsNull()) {
-			string key = child_types[i].first;
+			string key = child_types[i].first.GetIdentifierName();
 			string value = children[i].ToString();
 			req_headers.Insert(key, value);
 		}
@@ -511,7 +511,7 @@ static string BuildUrlWithParams(const string &base_url, const Value &params_val
 
 	for (idx_t i = 0; i < child_types.size(); i++) {
 		if (!children[i].IsNull()) {
-			string key = child_types[i].first;
+			string key = child_types[i].first.GetIdentifierName();
 			string value = children[i].ToString();
 			url += has_query ? "&" : "?";
 			url += StringUtil::URLEncode(key) + "=" + StringUtil::URLEncode(value);
@@ -535,7 +535,7 @@ static string BuildFormEncodedBody(const Value &params_val) {
 
 	for (idx_t i = 0; i < child_types.size(); i++) {
 		if (!children[i].IsNull()) {
-			string key = child_types[i].first;
+			string key = child_types[i].first.GetIdentifierName();
 			string value = children[i].ToString();
 			if (!first) {
 				body += "&";
@@ -695,10 +695,13 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 	FileOpener::TryGetCurrentSetting(&opener, "http_keep_alive", http_keep_alive, &info);
 	FileOpener::TryGetCurrentSetting(&opener, "http_follow_redirects", http_follow_redirects, &info);
 
-	// Read proxy settings - first from secrets, then fall back to core settings
-	string http_proxy = config.options.http_proxy;
-	string http_proxy_username = config.options.http_proxy_username;
-	string http_proxy_password = config.options.http_proxy_password;
+	// Read proxy settings - first from generic settings, then fall back to secrets
+	string http_proxy;
+	string http_proxy_username;
+	string http_proxy_password;
+	FileOpener::TryGetCurrentSetting(&opener, "http_proxy", http_proxy, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_proxy_username", http_proxy_username, &info);
+	FileOpener::TryGetCurrentSetting(&opener, "http_proxy_password", http_proxy_password, &info);
 
 	// Try reading proxy from secrets (httpfs style)
 	KeyValueSecretReader secret_reader(opener, &info, "http");
@@ -747,7 +750,7 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 		auto &children = StructValue::GetChildren(headers_val);
 		for (idx_t i = 0; i < child_types.size(); i++) {
 			if (!children[i].IsNull()) {
-				headers.insert({child_types[i].first, children[i].ToString()});
+				headers.insert({child_types[i].first.GetIdentifierName(), children[i].ToString()});
 			}
 		}
 	}
@@ -885,9 +888,7 @@ static void PerformHttpRequestCore(ClientContext &context, const string &url, co
 
 struct HttpHeadersType {
 	static LogicalType GetDefault() {
-		auto type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
-		type.SetAlias("HTTP_HEADERS");
-		return type;
+		return LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR).WithAlias("HTTP_HEADERS");
 	}
 };
 
@@ -996,28 +997,6 @@ static void HttpRangeHeaderFunction(DataChunk &args, ExpressionState &state, Vec
 	}
 }
 
-// Bind function for http_range_header - handles named parameter reordering
-static unique_ptr<FunctionData> HttpRangeHeaderBind(ClientContext &context, ScalarFunction &bound_function,
-                                                    vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() == 2) {
-		idx_t offset_idx = 0;
-		idx_t length_idx = 1;
-
-		for (idx_t i = 0; i < arguments.size(); i++) {
-			if (StringUtil::CIEquals(arguments[i]->alias, "offset")) {
-				offset_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "length")) {
-				length_idx = i;
-			}
-		}
-
-		if (offset_idx == 1 && length_idx == 0) {
-			std::swap(arguments[0], arguments[1]);
-		}
-	}
-	return nullptr;
-}
-
 // Return type for http_range_header function
 static LogicalType CreateHttpRangeHeaderType() {
 	child_list_t<LogicalType> struct_children;
@@ -1114,28 +1093,6 @@ static void HttpHeadScalar3(DataChunk &args, ExpressionState &state, Vector &res
 	}
 }
 
-// Bind function for http_head(url, headers, params) - reorders arguments based on aliases
-static unique_ptr<FunctionData> HttpHeadScalar3Bind(ClientContext &context, ScalarFunction &bound_function,
-                                                    vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() == 3) {
-		idx_t headers_idx = 1;
-		idx_t params_idx = 2;
-
-		for (idx_t i = 1; i < arguments.size(); i++) {
-			if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
-				headers_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "params")) {
-				params_idx = i;
-			}
-		}
-
-		if (headers_idx == 2 && params_idx == 1) {
-			std::swap(arguments[1], arguments[2]);
-		}
-	}
-	return nullptr;
-}
-
 // http_get(url)
 static void HttpGetScalar1(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &url_vec = args.data[0];
@@ -1222,31 +1179,6 @@ static void HttpGetScalar3(DataChunk &args, ExpressionState &state, Vector &resu
 		}
 		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
-}
-
-// Bind function for http_get(url, headers, params) - reorders arguments based on aliases
-static unique_ptr<FunctionData> HttpGetScalar3Bind(ClientContext &context, ScalarFunction &bound_function,
-                                                   vector<unique_ptr<Expression>> &arguments) {
-	// Check if we have named arguments (aliases) and need to reorder
-	if (arguments.size() == 3) {
-		// Find indices for headers and params based on alias names
-		idx_t headers_idx = 1; // default position
-		idx_t params_idx = 2;  // default position
-
-		for (idx_t i = 1; i < arguments.size(); i++) {
-			if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
-				headers_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "params")) {
-				params_idx = i;
-			}
-		}
-
-		// Swap if needed to ensure headers is at index 1 and params at index 2
-		if (headers_idx == 2 && params_idx == 1) {
-			std::swap(arguments[1], arguments[2]);
-		}
-	}
-	return nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -1338,28 +1270,6 @@ static void HttpDeleteScalar3(DataChunk &args, ExpressionState &state, Vector &r
 	}
 }
 
-// Bind function for http_delete(url, headers, params) - reorders arguments based on aliases
-static unique_ptr<FunctionData> HttpDeleteScalar3Bind(ClientContext &context, ScalarFunction &bound_function,
-                                                      vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() == 3) {
-		idx_t headers_idx = 1;
-		idx_t params_idx = 2;
-
-		for (idx_t i = 1; i < arguments.size(); i++) {
-			if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
-				headers_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "params")) {
-				params_idx = i;
-			}
-		}
-
-		if (headers_idx == 2 && params_idx == 1) {
-			std::swap(arguments[1], arguments[2]);
-		}
-	}
-	return nullptr;
-}
-
 //------------------------------------------------------------------------------
 // http_post scalar functions
 //------------------------------------------------------------------------------
@@ -1447,28 +1357,6 @@ static void HttpPostScalar3(DataChunk &args, ExpressionState &state, Vector &res
 		}
 		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
-}
-
-// Bind function for http_post(url, headers, params) - reorders arguments based on aliases
-static unique_ptr<FunctionData> HttpPostScalar3Bind(ClientContext &context, ScalarFunction &bound_function,
-                                                    vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() == 3) {
-		idx_t headers_idx = 1;
-		idx_t params_idx = 2;
-
-		for (idx_t i = 1; i < arguments.size(); i++) {
-			if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
-				headers_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "params")) {
-				params_idx = i;
-			}
-		}
-
-		if (headers_idx == 2 && params_idx == 1) {
-			std::swap(arguments[1], arguments[2]);
-		}
-	}
-	return nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -1560,28 +1448,6 @@ static void HttpPutScalar3(DataChunk &args, ExpressionState &state, Vector &resu
 	}
 }
 
-// Bind function for http_put(url, headers, params) - reorders arguments based on aliases
-static unique_ptr<FunctionData> HttpPutScalar3Bind(ClientContext &context, ScalarFunction &bound_function,
-                                                   vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() == 3) {
-		idx_t headers_idx = 1;
-		idx_t params_idx = 2;
-
-		for (idx_t i = 1; i < arguments.size(); i++) {
-			if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
-				headers_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "params")) {
-				params_idx = i;
-			}
-		}
-
-		if (headers_idx == 2 && params_idx == 1) {
-			std::swap(arguments[1], arguments[2]);
-		}
-	}
-	return nullptr;
-}
-
 //------------------------------------------------------------------------------
 // http_patch scalar functions
 //------------------------------------------------------------------------------
@@ -1671,28 +1537,6 @@ static void HttpPatchScalar3(DataChunk &args, ExpressionState &state, Vector &re
 	}
 }
 
-// Bind function for http_patch(url, headers, params) - reorders arguments based on aliases
-static unique_ptr<FunctionData> HttpPatchScalar3Bind(ClientContext &context, ScalarFunction &bound_function,
-                                                     vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() == 3) {
-		idx_t headers_idx = 1;
-		idx_t params_idx = 2;
-
-		for (idx_t i = 1; i < arguments.size(); i++) {
-			if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
-				headers_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "params")) {
-				params_idx = i;
-			}
-		}
-
-		if (headers_idx == 2 && params_idx == 1) {
-			std::swap(arguments[1], arguments[2]);
-		}
-	}
-	return nullptr;
-}
-
 //------------------------------------------------------------------------------
 // http_post_form scalar functions (application/x-www-form-urlencoded)
 //------------------------------------------------------------------------------
@@ -1755,38 +1599,16 @@ static void HttpPostFormScalar3(DataChunk &args, ExpressionState &state, Vector 
 	}
 }
 
-// Bind function for http_post_form(url, params, headers) - allows params/headers reordering
-static unique_ptr<FunctionData> HttpPostFormScalar3Bind(ClientContext &context, ScalarFunction &bound_function,
-                                                        vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() == 3) {
-		idx_t params_idx = 1;
-		idx_t headers_idx = 2;
-
-		for (idx_t i = 1; i < arguments.size(); i++) {
-			if (StringUtil::CIEquals(arguments[i]->alias, "params")) {
-				params_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
-				headers_idx = i;
-			}
-		}
-
-		if (params_idx == 2 && headers_idx == 1) {
-			std::swap(arguments[1], arguments[2]);
-		}
-	}
-	return nullptr;
-}
-
 //------------------------------------------------------------------------------
 // MULTIPART FORM DATA FUNCTIONS
 //------------------------------------------------------------------------------
 
-// Convert DuckDB LIST of STRUCTs to MultipartFormDataItems
+// Convert DuckDB LIST of STRUCTs to UploadFormDataItems
 // Expected struct: {name: VARCHAR, content: BLOB/VARCHAR, filename: VARCHAR (optional), content_type: VARCHAR
 // (optional)}
-static duckdb_httplib_openssl::MultipartFormDataItems ValueToMultipartItems(const Value &files_val,
-                                                                            const Value &fields_val) {
-	duckdb_httplib_openssl::MultipartFormDataItems items;
+static duckdb_httplib_openssl::UploadFormDataItems ValueToMultipartItems(const Value &files_val,
+                                                                         const Value &fields_val) {
+	duckdb_httplib_openssl::UploadFormDataItems items;
 
 	// Process files (LIST of STRUCTs)
 	if (!files_val.IsNull() && files_val.type().id() == LogicalTypeId::LIST) {
@@ -1796,7 +1618,7 @@ static duckdb_httplib_openssl::MultipartFormDataItems ValueToMultipartItems(cons
 				continue;
 			}
 
-			duckdb_httplib_openssl::MultipartFormData item;
+			duckdb_httplib_openssl::UploadFormData item;
 			auto &struct_type = file_val.type();
 			auto &child_types = StructType::GetChildTypes(struct_type);
 			auto &children = StructValue::GetChildren(file_val);
@@ -1805,7 +1627,7 @@ static duckdb_httplib_openssl::MultipartFormDataItems ValueToMultipartItems(cons
 				if (children[i].IsNull()) {
 					continue;
 				}
-				string field_name = StringUtil::Lower(child_types[i].first);
+				string field_name = StringUtil::Lower(child_types[i].first.GetIdentifierName());
 				if (field_name == "name") {
 					item.name = children[i].ToString();
 				} else if (field_name == "content") {
@@ -1840,8 +1662,8 @@ static duckdb_httplib_openssl::MultipartFormDataItems ValueToMultipartItems(cons
 			if (children[i].IsNull()) {
 				continue;
 			}
-			duckdb_httplib_openssl::MultipartFormData item;
-			item.name = child_types[i].first;
+			duckdb_httplib_openssl::UploadFormData item;
+			item.name = child_types[i].first.GetIdentifierName();
 			item.content = children[i].ToString();
 			// No filename = regular form field
 			items.push_back(item);
@@ -1854,7 +1676,7 @@ static duckdb_httplib_openssl::MultipartFormDataItems ValueToMultipartItems(cons
 // Thread-safe multipart POST execution
 static HttpResponseData ExecuteMultipartPostThreadSafe(const HttpSettings &settings, const string &url,
                                                        const duckdb_httplib_openssl::Headers &headers,
-                                                       const duckdb_httplib_openssl::MultipartFormDataItems &items) {
+                                                       const duckdb_httplib_openssl::UploadFormDataItems &items) {
 	HttpResponseData result;
 	result.status_code = 0;
 	result.content_length = -1;
@@ -1927,7 +1749,8 @@ static HttpResponseData ExecuteMultipartPostThreadSafe(const HttpSettings &setti
 				}
 				if (!found) {
 					result.header_keys.push_back(Value(normalized_key));
-					result.header_values.push_back(Value::LIST(LogicalType::VARCHAR, {Value(header.second)}));
+					result.header_values.push_back(
+					    Value::LIST(LogicalType(LogicalTypeId::VARCHAR), vector<Value> {Value(header.second)}));
 				}
 			}
 		}
@@ -1954,7 +1777,7 @@ static HttpResponseData ExecuteMultipartPostThreadSafe(const HttpSettings &setti
 // Parallel execution for multipart POST
 static void ExecuteMultipartPostParallel(ClientContext &context, const vector<string> &urls,
                                          const vector<duckdb_httplib_openssl::Headers> &headers_list,
-                                         const vector<duckdb_httplib_openssl::MultipartFormDataItems> &items_list,
+                                         const vector<duckdb_httplib_openssl::UploadFormDataItems> &items_list,
                                          vector<HttpResponseData> &results) {
 	idx_t count = urls.size();
 	results.resize(count);
@@ -2003,7 +1826,7 @@ static void HttpPostMultipartScalar2(DataChunk &args, ExpressionState &state, Ve
 
 	vector<string> urls(count);
 	vector<duckdb_httplib_openssl::Headers> headers_list(count);
-	vector<duckdb_httplib_openssl::MultipartFormDataItems> items_list(count);
+	vector<duckdb_httplib_openssl::UploadFormDataItems> items_list(count);
 
 	for (idx_t i = 0; i < count; i++) {
 		urls[i] = url_vec.GetValue(i).GetValue<string>();
@@ -2031,7 +1854,7 @@ static void HttpPostMultipartScalar3(DataChunk &args, ExpressionState &state, Ve
 
 	vector<string> urls(count);
 	vector<duckdb_httplib_openssl::Headers> headers_list(count);
-	vector<duckdb_httplib_openssl::MultipartFormDataItems> items_list(count);
+	vector<duckdb_httplib_openssl::UploadFormDataItems> items_list(count);
 
 	for (idx_t i = 0; i < count; i++) {
 		urls[i] = url_vec.GetValue(i).GetValue<string>();
@@ -2060,7 +1883,7 @@ static void HttpPostMultipartScalar4(DataChunk &args, ExpressionState &state, Ve
 
 	vector<string> urls(count);
 	vector<duckdb_httplib_openssl::Headers> headers_list(count);
-	vector<duckdb_httplib_openssl::MultipartFormDataItems> items_list(count);
+	vector<duckdb_httplib_openssl::UploadFormDataItems> items_list(count);
 
 	for (idx_t i = 0; i < count; i++) {
 		urls[i] = url_vec.GetValue(i).GetValue<string>();
@@ -2077,43 +1900,6 @@ static void HttpPostMultipartScalar4(DataChunk &args, ExpressionState &state, Ve
 		}
 		result.SetValue(i, BuildHttpResponseFromData(results[i]));
 	}
-}
-
-// Bind function for http_post_multipart - allows named parameter reordering
-static unique_ptr<FunctionData> HttpPostMultipartScalarBind(ClientContext &context, ScalarFunction &bound_function,
-                                                            vector<unique_ptr<Expression>> &arguments) {
-	// Handle named parameter reordering for 3 and 4 arg versions
-	if (arguments.size() >= 3) {
-		// Map aliases to expected positions
-		idx_t files_idx = 1;
-		idx_t fields_idx = 2;
-		idx_t headers_idx = (arguments.size() == 4) ? 3 : -1;
-
-		for (idx_t i = 1; i < arguments.size(); i++) {
-			if (StringUtil::CIEquals(arguments[i]->alias, "files")) {
-				files_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "fields")) {
-				fields_idx = i;
-			} else if (StringUtil::CIEquals(arguments[i]->alias, "headers")) {
-				headers_idx = i;
-			}
-		}
-
-		// Reorder if needed
-		if (arguments.size() == 3 && files_idx != 1) {
-			std::swap(arguments[1], arguments[files_idx == 2 ? 2 : 1]);
-		}
-		if (arguments.size() == 4) {
-			// Ensure order: url, files, fields, headers
-			vector<unique_ptr<Expression>> reordered;
-			reordered.push_back(std::move(arguments[0]));
-			reordered.push_back(std::move(arguments[files_idx]));
-			reordered.push_back(std::move(arguments[fields_idx]));
-			reordered.push_back(std::move(arguments[headers_idx]));
-			arguments = std::move(reordered);
-		}
-	}
-	return nullptr;
 }
 
 //------------------------------------------------------------------------------
@@ -2134,7 +1920,7 @@ struct HttpTableState : public GlobalTableFunctionState {
 };
 
 // Helper to set common return types for all HTTP functions
-static void SetHttpReturnTypes(vector<LogicalType> &return_types, vector<string> &names) {
+static void SetHttpReturnTypes(vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types.push_back(LogicalType::INTEGER);
 	names.push_back("status");
 
@@ -2155,7 +1941,7 @@ static void SetHttpReturnTypes(vector<LogicalType> &return_types, vector<string>
 }
 
 static unique_ptr<FunctionData> HttpGetTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<HttpTableBindData>();
 	result->url = input.inputs[0].GetValue<string>();
 	result->method = "GET";
@@ -2180,7 +1966,7 @@ static unique_ptr<FunctionData> HttpGetTableBind(ClientContext &context, TableFu
 }
 
 static unique_ptr<FunctionData> HttpHeadTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<HttpTableBindData>();
 	result->url = input.inputs[0].GetValue<string>();
 	result->method = "HEAD";
@@ -2205,7 +1991,7 @@ static unique_ptr<FunctionData> HttpHeadTableBind(ClientContext &context, TableF
 }
 
 static unique_ptr<FunctionData> HttpDeleteTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<HttpTableBindData>();
 	result->url = input.inputs[0].GetValue<string>();
 	result->method = "DELETE";
@@ -2230,7 +2016,7 @@ static unique_ptr<FunctionData> HttpDeleteTableBind(ClientContext &context, Tabl
 }
 
 static unique_ptr<FunctionData> HttpPostTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<HttpTableBindData>();
 	result->url = input.inputs[0].GetValue<string>();
 	result->method = "POST";
@@ -2266,7 +2052,7 @@ static unique_ptr<FunctionData> HttpPostTableBind(ClientContext &context, TableF
 }
 
 static unique_ptr<FunctionData> HttpPutTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<HttpTableBindData>();
 	result->url = input.inputs[0].GetValue<string>();
 	result->method = "PUT";
@@ -2302,7 +2088,7 @@ static unique_ptr<FunctionData> HttpPutTableBind(ClientContext &context, TableFu
 }
 
 static unique_ptr<FunctionData> HttpPatchTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<HttpTableBindData>();
 	result->url = input.inputs[0].GetValue<string>();
 	result->method = "PATCH";
@@ -2338,7 +2124,7 @@ static unique_ptr<FunctionData> HttpPatchTableBind(ClientContext &context, Table
 }
 
 static unique_ptr<FunctionData> HttpPostFormTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<HttpTableBindData>();
 	result->url = input.inputs[0].GetValue<string>();
 	result->method = "POST";
@@ -2409,7 +2195,8 @@ struct HttpMultipartTableState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> HttpPostMultipartTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                                           vector<LogicalType> &return_types,
+                                                           vector<Identifier> &names) {
 	auto result = make_uniq<HttpMultipartTableBindData>();
 	result->url = input.inputs[0].GetValue<string>();
 	result->files = Value();
@@ -2498,8 +2285,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register http_range_header(offset, length) helper function - returns STRUCT for headers parameter
 	auto http_range_header_type = CreateHttpRangeHeaderType();
-	ScalarFunction http_range_header_func("http_range_header", {LogicalType::BIGINT, LogicalType::BIGINT},
-	                                      http_range_header_type, HttpRangeHeaderFunction, HttpRangeHeaderBind);
+	ScalarFunction http_range_header_func("http_range_header",
+	                                      {{"offset", LogicalType::BIGINT}, {"length", LogicalType::BIGINT}},
+	                                      http_range_header_type, HttpRangeHeaderFunction);
 	loader.RegisterFunction(http_range_header_func);
 
 	// Register HTTP_HEADERS extension type
@@ -2515,178 +2303,206 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register http_head scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_head_scalar("http_head");
 	ScalarFunction http_head_1({LogicalType::VARCHAR}, http_response_type, HttpHeadScalar1);
-	http_head_1.stability = FunctionStability::VOLATILE;
+	http_head_1.SetVolatile();
 	http_head_scalar.AddFunction(http_head_1);
-	ScalarFunction http_head_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpHeadScalar2);
-	http_head_2.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_head_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
+	                           HttpHeadScalar2);
+	http_head_2.SetVolatile();
 	http_head_scalar.AddFunction(http_head_2);
-	ScalarFunction http_head_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
-	                           HttpHeadScalar3, HttpHeadScalar3Bind);
-	http_head_3.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_head_3(
+	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
+	    http_response_type, HttpHeadScalar3);
+	http_head_3.SetVolatile();
 	http_head_scalar.AddFunction(http_head_3);
 	loader.RegisterFunction(http_head_scalar);
 
 	// Register http_get scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_get_scalar("http_get");
 	ScalarFunction http_get_1({LogicalType::VARCHAR}, http_response_type, HttpGetScalar1);
-	http_get_1.stability = FunctionStability::VOLATILE;
+	http_get_1.SetVolatile();
 	http_get_scalar.AddFunction(http_get_1);
-	ScalarFunction http_get_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpGetScalar2);
-	http_get_2.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_get_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
+	                          HttpGetScalar2);
+	http_get_2.SetVolatile();
 	http_get_scalar.AddFunction(http_get_2);
-	ScalarFunction http_get_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
-	                          HttpGetScalar3, HttpGetScalar3Bind);
-	http_get_3.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_get_3(
+	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
+	    http_response_type, HttpGetScalar3);
+	http_get_3.SetVolatile();
 	http_get_scalar.AddFunction(http_get_3);
 	loader.RegisterFunction(http_get_scalar);
 
 	// Register http_head table function (with named parameters)
 	TableFunction http_head_table("http_head", {LogicalType::VARCHAR}, HttpTableFunction, HttpHeadTableBind,
 	                              HttpTableInit);
-	http_head_table.named_parameters["headers"] = LogicalType::ANY;
-	http_head_table.named_parameters["params"] = LogicalType::ANY;
+	http_head_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY);
+	});
 	loader.RegisterFunction(http_head_table);
 
 	// Register http_get table function (with named parameters)
 	TableFunction http_get_table("http_get", {LogicalType::VARCHAR}, HttpTableFunction, HttpGetTableBind,
 	                             HttpTableInit);
-	http_get_table.named_parameters["headers"] = LogicalType::ANY;
-	http_get_table.named_parameters["params"] = LogicalType::ANY;
+	http_get_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY);
+	});
 	loader.RegisterFunction(http_get_table);
 
 	// Register http_delete scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_delete_scalar("http_delete");
 	ScalarFunction http_delete_1({LogicalType::VARCHAR}, http_response_type, HttpDeleteScalar1);
-	http_delete_1.stability = FunctionStability::VOLATILE;
+	http_delete_1.SetVolatile();
 	http_delete_scalar.AddFunction(http_delete_1);
-	ScalarFunction http_delete_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpDeleteScalar2);
-	http_delete_2.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_delete_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
+	                             HttpDeleteScalar2);
+	http_delete_2.SetVolatile();
 	http_delete_scalar.AddFunction(http_delete_2);
-	ScalarFunction http_delete_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
-	                             HttpDeleteScalar3, HttpDeleteScalar3Bind);
-	http_delete_3.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_delete_3(
+	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
+	    http_response_type, HttpDeleteScalar3);
+	http_delete_3.SetVolatile();
 	http_delete_scalar.AddFunction(http_delete_3);
 	loader.RegisterFunction(http_delete_scalar);
 
 	// Register http_delete table function (with named parameters)
 	TableFunction http_delete_table("http_delete", {LogicalType::VARCHAR}, HttpTableFunction, HttpDeleteTableBind,
 	                                HttpTableInit);
-	http_delete_table.named_parameters["headers"] = LogicalType::ANY;
-	http_delete_table.named_parameters["params"] = LogicalType::ANY;
+	http_delete_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY);
+	});
 	loader.RegisterFunction(http_delete_table);
 
 	// Register http_post scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_post_scalar("http_post");
 	ScalarFunction http_post_1({LogicalType::VARCHAR}, http_response_type, HttpPostScalar1);
-	http_post_1.stability = FunctionStability::VOLATILE;
+	http_post_1.SetVolatile();
 	http_post_scalar.AddFunction(http_post_1);
-	ScalarFunction http_post_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPostScalar2);
-	http_post_2.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_post_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
+	                           HttpPostScalar2);
+	http_post_2.SetVolatile();
 	http_post_scalar.AddFunction(http_post_2);
-	ScalarFunction http_post_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
-	                           HttpPostScalar3, HttpPostScalar3Bind);
-	http_post_3.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_post_3(
+	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
+	    http_response_type, HttpPostScalar3);
+	http_post_3.SetVolatile();
 	http_post_scalar.AddFunction(http_post_3);
 	loader.RegisterFunction(http_post_scalar);
 
 	// Register http_post table function (with named parameters)
 	TableFunction http_post_table("http_post", {LogicalType::VARCHAR}, HttpTableFunction, HttpPostTableBind,
 	                              HttpTableInit);
-	http_post_table.named_parameters["headers"] = LogicalType::ANY;
-	http_post_table.named_parameters["params"] = LogicalType::ANY;
-	http_post_table.named_parameters["body"] = LogicalType::BLOB;
-	http_post_table.named_parameters["content_type"] = LogicalType::VARCHAR;
+	http_post_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY)
+		    .Add("params", LogicalType::ANY)
+		    .Add("body", LogicalType::BLOB)
+		    .Add("content_type", LogicalType::VARCHAR);
+	});
 	loader.RegisterFunction(http_post_table);
 
 	// Register http_put scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_put_scalar("http_put");
 	ScalarFunction http_put_1({LogicalType::VARCHAR}, http_response_type, HttpPutScalar1);
-	http_put_1.stability = FunctionStability::VOLATILE;
+	http_put_1.SetVolatile();
 	http_put_scalar.AddFunction(http_put_1);
-	ScalarFunction http_put_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPutScalar2);
-	http_put_2.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_put_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
+	                          HttpPutScalar2);
+	http_put_2.SetVolatile();
 	http_put_scalar.AddFunction(http_put_2);
-	ScalarFunction http_put_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
-	                          HttpPutScalar3, HttpPutScalar3Bind);
-	http_put_3.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_put_3(
+	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
+	    http_response_type, HttpPutScalar3);
+	http_put_3.SetVolatile();
 	http_put_scalar.AddFunction(http_put_3);
 	loader.RegisterFunction(http_put_scalar);
 
 	// Register http_put table function (with named parameters)
 	TableFunction http_put_table("http_put", {LogicalType::VARCHAR}, HttpTableFunction, HttpPutTableBind,
 	                             HttpTableInit);
-	http_put_table.named_parameters["headers"] = LogicalType::ANY;
-	http_put_table.named_parameters["params"] = LogicalType::ANY;
-	http_put_table.named_parameters["body"] = LogicalType::BLOB;
-	http_put_table.named_parameters["content_type"] = LogicalType::VARCHAR;
+	http_put_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY)
+		    .Add("params", LogicalType::ANY)
+		    .Add("body", LogicalType::BLOB)
+		    .Add("content_type", LogicalType::VARCHAR);
+	});
 	loader.RegisterFunction(http_put_table);
 
 	// Register http_patch scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_patch_scalar("http_patch");
 	ScalarFunction http_patch_1({LogicalType::VARCHAR}, http_response_type, HttpPatchScalar1);
-	http_patch_1.stability = FunctionStability::VOLATILE;
+	http_patch_1.SetVolatile();
 	http_patch_scalar.AddFunction(http_patch_1);
-	ScalarFunction http_patch_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPatchScalar2);
-	http_patch_2.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_patch_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
+	                            HttpPatchScalar2);
+	http_patch_2.SetVolatile();
 	http_patch_scalar.AddFunction(http_patch_2);
-	ScalarFunction http_patch_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
-	                            HttpPatchScalar3, HttpPatchScalar3Bind);
-	http_patch_3.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_patch_3(
+	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
+	    http_response_type, HttpPatchScalar3);
+	http_patch_3.SetVolatile();
 	http_patch_scalar.AddFunction(http_patch_3);
 	loader.RegisterFunction(http_patch_scalar);
 
 	// Register http_patch table function (with named parameters)
 	TableFunction http_patch_table("http_patch", {LogicalType::VARCHAR}, HttpTableFunction, HttpPatchTableBind,
 	                               HttpTableInit);
-	http_patch_table.named_parameters["headers"] = LogicalType::ANY;
-	http_patch_table.named_parameters["params"] = LogicalType::ANY;
-	http_patch_table.named_parameters["body"] = LogicalType::BLOB;
-	http_patch_table.named_parameters["content_type"] = LogicalType::VARCHAR;
+	http_patch_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY)
+		    .Add("params", LogicalType::ANY)
+		    .Add("body", LogicalType::BLOB)
+		    .Add("content_type", LogicalType::VARCHAR);
+	});
 	loader.RegisterFunction(http_patch_table);
 
 	// Register http_post_form scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_post_form_scalar("http_post_form");
-	ScalarFunction http_post_form_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type, HttpPostFormScalar2);
-	http_post_form_2.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_post_form_2({{"url", LogicalType::VARCHAR}, {"params", LogicalType::ANY}}, http_response_type,
+	                                HttpPostFormScalar2);
+	http_post_form_2.SetVolatile();
 	http_post_form_scalar.AddFunction(http_post_form_2);
-	ScalarFunction http_post_form_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
-	                                HttpPostFormScalar3, HttpPostFormScalar3Bind);
-	http_post_form_3.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_post_form_3(
+	    {{"url", LogicalType::VARCHAR}, {"params", LogicalType::ANY}, {"headers", LogicalType::ANY}},
+	    http_response_type, HttpPostFormScalar3);
+	http_post_form_3.SetVolatile();
 	http_post_form_scalar.AddFunction(http_post_form_3);
 	loader.RegisterFunction(http_post_form_scalar);
 
 	// Register http_post_form table function (with named parameters)
 	TableFunction http_post_form_table("http_post_form", {LogicalType::VARCHAR}, HttpTableFunction,
 	                                   HttpPostFormTableBind, HttpTableInit);
-	http_post_form_table.named_parameters["headers"] = LogicalType::ANY;
-	http_post_form_table.named_parameters["params"] = LogicalType::ANY;
+	http_post_form_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("headers", LogicalType::ANY).Add("params", LogicalType::ANY);
+	});
 	loader.RegisterFunction(http_post_form_table);
 
 	// Register http_post_multipart scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_post_multipart_scalar("http_post_multipart");
 	// http_post_multipart(url, files)
-	ScalarFunction http_post_multipart_2({LogicalType::VARCHAR, LogicalType::ANY}, http_response_type,
-	                                     HttpPostMultipartScalar2);
-	http_post_multipart_2.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_post_multipart_2({{"url", LogicalType::VARCHAR}, {"files", LogicalType::ANY}},
+	                                     http_response_type, HttpPostMultipartScalar2);
+	http_post_multipart_2.SetVolatile();
 	http_post_multipart_scalar.AddFunction(http_post_multipart_2);
 	// http_post_multipart(url, files, fields)
-	ScalarFunction http_post_multipart_3({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY}, http_response_type,
-	                                     HttpPostMultipartScalar3, HttpPostMultipartScalarBind);
-	http_post_multipart_3.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_post_multipart_3(
+	    {{"url", LogicalType::VARCHAR}, {"files", LogicalType::ANY}, {"fields", LogicalType::ANY}}, http_response_type,
+	    HttpPostMultipartScalar3);
+	http_post_multipart_3.SetVolatile();
 	http_post_multipart_scalar.AddFunction(http_post_multipart_3);
 	// http_post_multipart(url, files, fields, headers)
-	ScalarFunction http_post_multipart_4({LogicalType::VARCHAR, LogicalType::ANY, LogicalType::ANY, LogicalType::ANY},
-	                                     http_response_type, HttpPostMultipartScalar4, HttpPostMultipartScalarBind);
-	http_post_multipart_4.stability = FunctionStability::VOLATILE;
+	ScalarFunction http_post_multipart_4({{"url", LogicalType::VARCHAR},
+	                                      {"files", LogicalType::ANY},
+	                                      {"fields", LogicalType::ANY},
+	                                      {"headers", LogicalType::ANY}},
+	                                     http_response_type, HttpPostMultipartScalar4);
+	http_post_multipart_4.SetVolatile();
 	http_post_multipart_scalar.AddFunction(http_post_multipart_4);
 	loader.RegisterFunction(http_post_multipart_scalar);
 
 	// Register http_post_multipart table function (with named parameters)
 	TableFunction http_post_multipart_table("http_post_multipart", {LogicalType::VARCHAR}, HttpMultipartTableFunction,
 	                                        HttpPostMultipartTableBind, HttpMultipartTableInit);
-	http_post_multipart_table.named_parameters["files"] = LogicalType::ANY;
-	http_post_multipart_table.named_parameters["fields"] = LogicalType::ANY;
-	http_post_multipart_table.named_parameters["headers"] = LogicalType::ANY;
+	http_post_multipart_table.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("files", LogicalType::ANY).Add("fields", LogicalType::ANY).Add("headers", LogicalType::ANY);
+	});
 	loader.RegisterFunction(http_post_multipart_table);
 }
 
