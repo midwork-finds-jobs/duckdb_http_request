@@ -2,16 +2,12 @@
 # description: test all HTTP methods with echo server
 # group: [sql]
 
-require httputil_request
+require http_request
 
 require httpfs
 
-# Load JSON extension for parsing echo server responses
-statement ok
-INSTALL json;
-
-statement ok
-LOAD json;
+# JSON extension for parsing echo server responses
+require json
 
 #------------------------------------------------------------------------------
 # http_get - verify method, headers, and params
@@ -62,7 +58,7 @@ DELETE	token
 #------------------------------------------------------------------------------
 
 query III
-WITH resp AS (SELECT decode(http_post('https://echo.free.beeceptor.com/', 'hello', {'Content-Type': 'text/plain'}).body)::JSON as j)
+WITH resp AS (SELECT decode(body)::JSON as j FROM http_post('https://echo.free.beeceptor.com/', body := 'hello', content_type := 'text/plain'))
 SELECT j->>'method', j->>'rawBody', j->'headers'->>'Content-Type' FROM resp;
 ----
 POST	hello	text/plain
@@ -79,7 +75,7 @@ POST	table post
 #------------------------------------------------------------------------------
 
 query II
-WITH resp AS (SELECT decode(http_put('https://echo.free.beeceptor.com/', 'put data').body)::JSON as j)
+WITH resp AS (SELECT decode(body)::JSON as j FROM http_put('https://echo.free.beeceptor.com/', body := 'put data'))
 SELECT j->>'method', j->>'rawBody' FROM resp;
 ----
 PUT	put data
@@ -89,7 +85,7 @@ PUT	put data
 #------------------------------------------------------------------------------
 
 query II
-WITH resp AS (SELECT decode(http_patch('https://echo.free.beeceptor.com/', 'patch data').body)::JSON as j)
+WITH resp AS (SELECT decode(body)::JSON as j FROM http_patch('https://echo.free.beeceptor.com/', body := 'patch data'))
 SELECT j->>'method', j->>'rawBody' FROM resp;
 ----
 PATCH	patch data
