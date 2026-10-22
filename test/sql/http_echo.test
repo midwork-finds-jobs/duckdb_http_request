@@ -1,6 +1,8 @@
 # name: test/sql/http_echo.test
-# description: test all HTTP methods with echo server
+# description: test all HTTP methods against the local mock echo server
 # group: [sql]
+
+require-env HTTP_REQUEST_TEST_SERVER
 
 require http_request
 
@@ -15,20 +17,20 @@ require json
 
 # GET scalar - verify method
 query I
-SELECT decode(http_get('https://echo.free.beeceptor.com/').body)::JSON->>'method';
+SELECT decode(http_get('{HTTP_REQUEST_TEST_SERVER}/echo').body)::JSON->>'method';
 ----
 GET
 
 # GET scalar with headers and params - verify all passed correctly (single request via CTE)
 query III
-WITH resp AS (SELECT decode(http_get('https://echo.free.beeceptor.com/', {'X-Custom': 'test'}, {'foo': 'bar'}).body)::JSON as j)
+WITH resp AS (SELECT decode(http_get('{HTTP_REQUEST_TEST_SERVER}/echo', {'X-Custom': 'test'}, {'foo': 'bar'}).body)::JSON as j)
 SELECT j->>'method', j->'headers'->>'X-Custom', j->'parsedQueryParams'->>'foo' FROM resp;
 ----
 GET	test	bar
 
 # GET table function with named params (reordered)
 query II
-WITH resp AS (SELECT decode(body)::JSON as j FROM http_get('https://echo.free.beeceptor.com/', params := {'p': '1'}, headers := {'H': '2'}))
+WITH resp AS (SELECT decode(body)::JSON as j FROM http_get('{HTTP_REQUEST_TEST_SERVER}/echo', params := {'p': '1'}, headers := {'H': '2'}))
 SELECT j->'headers'->>'H', j->'parsedQueryParams'->>'p' FROM resp;
 ----
 2	1
@@ -38,7 +40,7 @@ SELECT j->'headers'->>'H', j->'parsedQueryParams'->>'p' FROM resp;
 #------------------------------------------------------------------------------
 
 query II
-WITH resp AS (SELECT * FROM http_head('https://echo.free.beeceptor.com/'))
+WITH resp AS (SELECT * FROM http_head('{HTTP_REQUEST_TEST_SERVER}/echo'))
 SELECT status, octet_length(body) FROM resp;
 ----
 200	0
@@ -48,7 +50,7 @@ SELECT status, octet_length(body) FROM resp;
 #------------------------------------------------------------------------------
 
 query II
-WITH resp AS (SELECT decode(http_delete('https://echo.free.beeceptor.com/', {'Auth': 'token'}).body)::JSON as j)
+WITH resp AS (SELECT decode(http_delete('{HTTP_REQUEST_TEST_SERVER}/echo', {'Auth': 'token'}).body)::JSON as j)
 SELECT j->>'method', j->'headers'->>'Auth' FROM resp;
 ----
 DELETE	token
@@ -58,14 +60,14 @@ DELETE	token
 #------------------------------------------------------------------------------
 
 query III
-WITH resp AS (SELECT decode(body)::JSON as j FROM http_post('https://echo.free.beeceptor.com/', body := 'hello', content_type := 'text/plain'))
+WITH resp AS (SELECT decode(body)::JSON as j FROM http_post('{HTTP_REQUEST_TEST_SERVER}/echo', body := 'hello', content_type := 'text/plain'))
 SELECT j->>'method', j->>'rawBody', j->'headers'->>'Content-Type' FROM resp;
 ----
 POST	hello	text/plain
 
 # POST table function
 query II
-WITH resp AS (SELECT decode(body)::JSON as j FROM http_post('https://echo.free.beeceptor.com/', body := 'table post'))
+WITH resp AS (SELECT decode(body)::JSON as j FROM http_post('{HTTP_REQUEST_TEST_SERVER}/echo', body := 'table post'))
 SELECT j->>'method', j->>'rawBody' FROM resp;
 ----
 POST	table post
@@ -75,7 +77,7 @@ POST	table post
 #------------------------------------------------------------------------------
 
 query II
-WITH resp AS (SELECT decode(body)::JSON as j FROM http_put('https://echo.free.beeceptor.com/', body := 'put data'))
+WITH resp AS (SELECT decode(body)::JSON as j FROM http_put('{HTTP_REQUEST_TEST_SERVER}/echo', body := 'put data'))
 SELECT j->>'method', j->>'rawBody' FROM resp;
 ----
 PUT	put data
@@ -85,7 +87,7 @@ PUT	put data
 #------------------------------------------------------------------------------
 
 query II
-WITH resp AS (SELECT decode(body)::JSON as j FROM http_patch('https://echo.free.beeceptor.com/', body := 'patch data'))
+WITH resp AS (SELECT decode(body)::JSON as j FROM http_patch('{HTTP_REQUEST_TEST_SERVER}/echo', body := 'patch data'))
 SELECT j->>'method', j->>'rawBody' FROM resp;
 ----
 PATCH	patch data
@@ -95,14 +97,14 @@ PATCH	patch data
 #------------------------------------------------------------------------------
 
 query III
-WITH resp AS (SELECT decode(http_post_form('https://echo.free.beeceptor.com/', {'user': 'john', 'pass': 'secret'}).body)::JSON as j)
+WITH resp AS (SELECT decode(http_post_form('{HTTP_REQUEST_TEST_SERVER}/echo', {'user': 'john', 'pass': 'secret'}).body)::JSON as j)
 SELECT j->>'method', j->'headers'->>'Content-Type', j->'parsedBody'->>'user' FROM resp;
 ----
 POST	application/x-www-form-urlencoded	john
 
 # POST form table function with headers
 query II
-WITH resp AS (SELECT decode(body)::JSON as j FROM http_post_form('https://echo.free.beeceptor.com/', params := {'key': 'val'}, headers := {'X-Form': 'yes'}))
+WITH resp AS (SELECT decode(body)::JSON as j FROM http_post_form('{HTTP_REQUEST_TEST_SERVER}/echo', params := {'key': 'val'}, headers := {'X-Form': 'yes'}))
 SELECT j->'parsedBody'->>'key', j->'headers'->>'X-Form' FROM resp;
 ----
 val	yes
@@ -112,6 +114,6 @@ val	yes
 #------------------------------------------------------------------------------
 
 query I
-SELECT decode(http_post_form('https://echo.free.beeceptor.com/', {'msg': 'hello world'}).body)::JSON->'parsedBody'->>'msg';
+SELECT decode(http_post_form('{HTTP_REQUEST_TEST_SERVER}/echo', {'msg': 'hello world'}).body)::JSON->'parsedBody'->>'msg';
 ----
 hello world
