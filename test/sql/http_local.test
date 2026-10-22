@@ -1,0 +1,220 @@
+# name: test/sql/http_local.test
+# description: http_request against the local mock server (scripts/run_mock_server.sh)
+# group: [sql]
+
+require-env HTTP_REQUEST_TEST_SERVER
+
+require http_request
+
+require httpfs
+
+#------------------------------------------------------------------------------
+# http_get scalar function
+#------------------------------------------------------------------------------
+
+# Basic GET returns struct with status, headers, body
+query I
+SELECT http_get('{HTTP_REQUEST_TEST_SERVER}/echo').status;
+----
+200
+
+# Body is returned as BLOB
+query I
+SELECT octet_length(http_get('{HTTP_REQUEST_TEST_SERVER}/echo').body) > 0;
+----
+true
+
+# Headers are returned as MAP
+query I
+SELECT http_get('{HTTP_REQUEST_TEST_SERVER}/echo').headers['Content-Type'] IS NOT NULL;
+----
+true
+
+# GET with custom headers
+query I
+SELECT http_get('{HTTP_REQUEST_TEST_SERVER}/get', {'Accept': 'application/json'}).status = 200;
+----
+true
+
+#------------------------------------------------------------------------------
+# http_head scalar function
+#------------------------------------------------------------------------------
+
+query I
+SELECT http_head('{HTTP_REQUEST_TEST_SERVER}/echo').status;
+----
+200
+
+# HEAD returns empty body
+query I
+SELECT octet_length(http_head('{HTTP_REQUEST_TEST_SERVER}/echo').body);
+----
+0
+
+# HEAD with custom headers
+query I
+SELECT http_head('{HTTP_REQUEST_TEST_SERVER}/get', {'Accept': 'application/json'}).status = 200;
+----
+true
+
+#------------------------------------------------------------------------------
+# http_get table function
+#------------------------------------------------------------------------------
+
+query I
+SELECT status FROM http_get('{HTTP_REQUEST_TEST_SERVER}/echo');
+----
+200
+
+query I
+SELECT octet_length(body) > 0 FROM http_get('{HTTP_REQUEST_TEST_SERVER}/echo');
+----
+true
+
+# Table function with named headers parameter
+query I
+SELECT status = 200 FROM http_get('{HTTP_REQUEST_TEST_SERVER}/get', headers := {'Accept': 'application/json'});
+----
+true
+
+#------------------------------------------------------------------------------
+# http_head table function
+#------------------------------------------------------------------------------
+
+query I
+SELECT status FROM http_head('{HTTP_REQUEST_TEST_SERVER}/echo');
+----
+200
+
+query I
+SELECT octet_length(body) FROM http_head('{HTTP_REQUEST_TEST_SERVER}/echo');
+----
+0
+
+# Table function with named headers parameter
+query I
+SELECT status = 200 FROM http_head('{HTTP_REQUEST_TEST_SERVER}/get', headers := {'Accept': 'text/html'});
+----
+true
+
+#------------------------------------------------------------------------------
+# Byte range requests (HTTP 206 Partial Content)
+#------------------------------------------------------------------------------
+
+# Using byte_range helper in headers struct
+query I
+SELECT http_get(
+    '{HTTP_REQUEST_TEST_SERVER}/range',
+    {'Range': byte_range(100, 1278)}
+).status = 206;
+----
+true
+
+# Range request returns exactly the requested bytes
+query I
+SELECT octet_length(http_get(
+    '{HTTP_REQUEST_TEST_SERVER}/range',
+    {'Range': byte_range(100, 1278)}
+).body);
+----
+1278
+
+# Table function with byte range
+query I
+SELECT status = 206 FROM http_get(
+    '{HTTP_REQUEST_TEST_SERVER}/range',
+    headers := {'Range': byte_range(100, 1278)}
+);
+----
+true
+
+#------------------------------------------------------------------------------
+# http_follow_redirects setting
+#------------------------------------------------------------------------------
+
+# Disable cache to test redirect setting changes properly
+statement ok
+SET http_request_cache = false;
+
+# Default: follows redirects
+query I
+SELECT http_get('{HTTP_REQUEST_TEST_SERVER}/redirect/1').status = 200;
+----
+true
+
+# Check setting exists and is default true
+query I
+SELECT current_setting('http_follow_redirects')::BOOLEAN;
+----
+true
+
+# Disable redirects: returns 302 with Location header
+statement ok
+SET http_follow_redirects = false;
+
+# Verify setting changed
+query I
+SELECT current_setting('http_follow_redirects')::BOOLEAN;
+----
+false
+
+# With redirects disabled, should return 302 
+query I
+SELECT http_get('{HTTP_REQUEST_TEST_SERVER}/redirect/1').status = 302;
+----
+true
+
+# Location header should point to final destination
+query I
+SELECT http_get('{HTTP_REQUEST_TEST_SERVER}/redirect/1').headers['Location'] IS NOT NULL;
+----
+true
+
+# Re-enable redirects
+statement ok
+SET http_follow_redirects = true;
+
+query I
+SELECT http_get('{HTTP_REQUEST_TEST_SERVER}/redirect/1').status = 200;
+----
+true
+
+# Re-enable cache
+statement ok
+SET http_request_cache = true;
+
+#------------------------------------------------------------------------------
+# HTTP_HEADERS type with case-insensitive [] access
+#------------------------------------------------------------------------------
+
+# Headers have HTTP_HEADERS type alias
+query I
+SELECT typeof(http_get('{HTTP_REQUEST_TEST_SERVER}/echo').headers);
+----
+HTTP_HEADERS
+
+# [] operator is case-insensitive - lowercase
+query I
+SELECT http_get('{HTTP_REQUEST_TEST_SERVER}/echo').headers['content-type'] IS NOT NULL;
+----
+true
+
+# [] operator is case-insensitive - UPPERCASE
+query I
+SELECT http_get('{HTTP_REQUEST_TEST_SERVER}/echo').headers['CONTENT-TYPE'] IS NOT NULL;
+----
+true
+
+# [] operator is case-insensitive - mixed case
+query I
+SELECT http_get('{HTTP_REQUEST_TEST_SERVER}/echo').headers['Content-Type'] IS NOT NULL;
+----
+true
+
+# All cases return the same value
+query I
+SELECT h['content-type'] = h['Content-Type'] AND h['Content-Type'] = h['CONTENT-TYPE']
+FROM (SELECT http_get('{HTTP_REQUEST_TEST_SERVER}/echo').headers as h);
+----
+true
+
