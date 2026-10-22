@@ -33,8 +33,17 @@ jobs:
         env:
           VCPKG_TARGET_TRIPLET: x64-linux
 
+      - name: Start mock HTTP server
+        run: ./scripts/run_mock_server.sh
+
       - name: Run Unit Tests
         run: ./build/release/test/unittest --test-dir test
+        env:
+          HTTP_REQUEST_TEST_SERVER: http://127.0.0.1:8787
+
+      - name: Stop mock HTTP server
+        if: always()
+        run: ./scripts/stop_mock_server.sh
 
   test-macos:
     name: Test (macOS)
@@ -61,5 +70,14 @@ jobs:
         env:
           VCPKG_TARGET_TRIPLET: x64-osx
 
+      - name: Start mock HTTP server
+        run: ./scripts/run_mock_server.sh
+
       - name: Run Unit Tests
         run: ./build/release/test/unittest --test-dir test
+        env:
+          HTTP_REQUEST_TEST_SERVER: http://127.0.0.1:8787
+
+      - name: Stop mock HTTP server
+        if: always()
+        run: ./scripts/stop_mock_server.sh
