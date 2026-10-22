@@ -14,3 +14,6 @@ duckdb_extension_load(httpfs
 
 # JSON is used by tests to parse echo server responses
 duckdb_extension_load(json)
+
+# Link into unittest/shell so tests can `require` them (DuckDB v2 no longer links by default)
+duckdb_extension_statically_link(http_request httpfs json)
