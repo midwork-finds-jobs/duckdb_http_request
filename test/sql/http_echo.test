@@ -6,12 +6,8 @@ require http_request
 
 require httpfs
 
-# Load JSON extension for parsing echo server responses
-statement ok
-INSTALL json;
-
-statement ok
-LOAD json;
+# JSON extension for parsing echo server responses
+require json
 
 #------------------------------------------------------------------------------
 # http_get - verify method, headers, and params
