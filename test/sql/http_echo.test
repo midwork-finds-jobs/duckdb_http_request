@@ -2,7 +2,7 @@
 # description: test all HTTP methods with echo server
 # group: [sql]
 
-require httputil_request
+require http_request
 
 require httpfs
 
