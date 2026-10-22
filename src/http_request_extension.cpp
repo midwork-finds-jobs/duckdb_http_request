@@ -2281,6 +2281,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register byte_range(offset, length) helper function
 	ScalarFunction byte_range_func("byte_range", {LogicalType::BIGINT, LogicalType::BIGINT}, LogicalType::VARCHAR,
 	                               ByteRangeFunction);
+	byte_range_func.SetFallible();
 	loader.RegisterFunction(byte_range_func);
 
 	// Register http_range_header(offset, length) helper function - returns STRUCT for headers parameter
@@ -2288,6 +2289,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction http_range_header_func("http_range_header",
 	                                      {{"offset", LogicalType::BIGINT}, {"length", LogicalType::BIGINT}},
 	                                      http_range_header_type, HttpRangeHeaderFunction);
+	http_range_header_func.SetFallible();
 	loader.RegisterFunction(http_range_header_func);
 
 	// Register HTTP_HEADERS extension type
@@ -2298,21 +2300,25 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// This enables headers['content-type'] to work regardless of case
 	ScalarFunction http_headers_extract("map_extract_value", {http_headers_type, LogicalType::VARCHAR},
 	                                    LogicalType::VARCHAR, HttpHeadersExtractValue);
+	http_headers_extract.SetFallible();
 	loader.RegisterFunction(http_headers_extract);
 
 	// Register http_head scalar functions (VOLATILE to prevent constant folding)
 	ScalarFunctionSet http_head_scalar("http_head");
 	ScalarFunction http_head_1({LogicalType::VARCHAR}, http_response_type, HttpHeadScalar1);
 	http_head_1.SetVolatile();
+	http_head_1.SetFallible();
 	http_head_scalar.AddFunction(http_head_1);
 	ScalarFunction http_head_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
 	                           HttpHeadScalar2);
 	http_head_2.SetVolatile();
+	http_head_2.SetFallible();
 	http_head_scalar.AddFunction(http_head_2);
 	ScalarFunction http_head_3(
 	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
 	    http_response_type, HttpHeadScalar3);
 	http_head_3.SetVolatile();
+	http_head_3.SetFallible();
 	http_head_scalar.AddFunction(http_head_3);
 	loader.RegisterFunction(http_head_scalar);
 
@@ -2320,15 +2326,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunctionSet http_get_scalar("http_get");
 	ScalarFunction http_get_1({LogicalType::VARCHAR}, http_response_type, HttpGetScalar1);
 	http_get_1.SetVolatile();
+	http_get_1.SetFallible();
 	http_get_scalar.AddFunction(http_get_1);
 	ScalarFunction http_get_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
 	                          HttpGetScalar2);
 	http_get_2.SetVolatile();
+	http_get_2.SetFallible();
 	http_get_scalar.AddFunction(http_get_2);
 	ScalarFunction http_get_3(
 	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
 	    http_response_type, HttpGetScalar3);
 	http_get_3.SetVolatile();
+	http_get_3.SetFallible();
 	http_get_scalar.AddFunction(http_get_3);
 	loader.RegisterFunction(http_get_scalar);
 
@@ -2352,15 +2361,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunctionSet http_delete_scalar("http_delete");
 	ScalarFunction http_delete_1({LogicalType::VARCHAR}, http_response_type, HttpDeleteScalar1);
 	http_delete_1.SetVolatile();
+	http_delete_1.SetFallible();
 	http_delete_scalar.AddFunction(http_delete_1);
 	ScalarFunction http_delete_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
 	                             HttpDeleteScalar2);
 	http_delete_2.SetVolatile();
+	http_delete_2.SetFallible();
 	http_delete_scalar.AddFunction(http_delete_2);
 	ScalarFunction http_delete_3(
 	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
 	    http_response_type, HttpDeleteScalar3);
 	http_delete_3.SetVolatile();
+	http_delete_3.SetFallible();
 	http_delete_scalar.AddFunction(http_delete_3);
 	loader.RegisterFunction(http_delete_scalar);
 
@@ -2376,15 +2388,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunctionSet http_post_scalar("http_post");
 	ScalarFunction http_post_1({LogicalType::VARCHAR}, http_response_type, HttpPostScalar1);
 	http_post_1.SetVolatile();
+	http_post_1.SetFallible();
 	http_post_scalar.AddFunction(http_post_1);
 	ScalarFunction http_post_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
 	                           HttpPostScalar2);
 	http_post_2.SetVolatile();
+	http_post_2.SetFallible();
 	http_post_scalar.AddFunction(http_post_2);
 	ScalarFunction http_post_3(
 	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
 	    http_response_type, HttpPostScalar3);
 	http_post_3.SetVolatile();
+	http_post_3.SetFallible();
 	http_post_scalar.AddFunction(http_post_3);
 	loader.RegisterFunction(http_post_scalar);
 
@@ -2403,15 +2418,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunctionSet http_put_scalar("http_put");
 	ScalarFunction http_put_1({LogicalType::VARCHAR}, http_response_type, HttpPutScalar1);
 	http_put_1.SetVolatile();
+	http_put_1.SetFallible();
 	http_put_scalar.AddFunction(http_put_1);
 	ScalarFunction http_put_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
 	                          HttpPutScalar2);
 	http_put_2.SetVolatile();
+	http_put_2.SetFallible();
 	http_put_scalar.AddFunction(http_put_2);
 	ScalarFunction http_put_3(
 	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
 	    http_response_type, HttpPutScalar3);
 	http_put_3.SetVolatile();
+	http_put_3.SetFallible();
 	http_put_scalar.AddFunction(http_put_3);
 	loader.RegisterFunction(http_put_scalar);
 
@@ -2430,15 +2448,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunctionSet http_patch_scalar("http_patch");
 	ScalarFunction http_patch_1({LogicalType::VARCHAR}, http_response_type, HttpPatchScalar1);
 	http_patch_1.SetVolatile();
+	http_patch_1.SetFallible();
 	http_patch_scalar.AddFunction(http_patch_1);
 	ScalarFunction http_patch_2({{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}}, http_response_type,
 	                            HttpPatchScalar2);
 	http_patch_2.SetVolatile();
+	http_patch_2.SetFallible();
 	http_patch_scalar.AddFunction(http_patch_2);
 	ScalarFunction http_patch_3(
 	    {{"url", LogicalType::VARCHAR}, {"headers", LogicalType::ANY}, {"params", LogicalType::ANY}},
 	    http_response_type, HttpPatchScalar3);
 	http_patch_3.SetVolatile();
+	http_patch_3.SetFallible();
 	http_patch_scalar.AddFunction(http_patch_3);
 	loader.RegisterFunction(http_patch_scalar);
 
@@ -2458,11 +2479,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction http_post_form_2({{"url", LogicalType::VARCHAR}, {"params", LogicalType::ANY}}, http_response_type,
 	                                HttpPostFormScalar2);
 	http_post_form_2.SetVolatile();
+	http_post_form_2.SetFallible();
 	http_post_form_scalar.AddFunction(http_post_form_2);
 	ScalarFunction http_post_form_3(
 	    {{"url", LogicalType::VARCHAR}, {"params", LogicalType::ANY}, {"headers", LogicalType::ANY}},
 	    http_response_type, HttpPostFormScalar3);
 	http_post_form_3.SetVolatile();
+	http_post_form_3.SetFallible();
 	http_post_form_scalar.AddFunction(http_post_form_3);
 	loader.RegisterFunction(http_post_form_scalar);
 
@@ -2480,12 +2503,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunction http_post_multipart_2({{"url", LogicalType::VARCHAR}, {"files", LogicalType::ANY}},
 	                                     http_response_type, HttpPostMultipartScalar2);
 	http_post_multipart_2.SetVolatile();
+	http_post_multipart_2.SetFallible();
 	http_post_multipart_scalar.AddFunction(http_post_multipart_2);
 	// http_post_multipart(url, files, fields)
 	ScalarFunction http_post_multipart_3(
 	    {{"url", LogicalType::VARCHAR}, {"files", LogicalType::ANY}, {"fields", LogicalType::ANY}}, http_response_type,
 	    HttpPostMultipartScalar3);
 	http_post_multipart_3.SetVolatile();
+	http_post_multipart_3.SetFallible();
 	http_post_multipart_scalar.AddFunction(http_post_multipart_3);
 	// http_post_multipart(url, files, fields, headers)
 	ScalarFunction http_post_multipart_4({{"url", LogicalType::VARCHAR},
@@ -2494,6 +2519,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                      {"headers", LogicalType::ANY}},
 	                                     http_response_type, HttpPostMultipartScalar4);
 	http_post_multipart_4.SetVolatile();
+	http_post_multipart_4.SetFallible();
 	http_post_multipart_scalar.AddFunction(http_post_multipart_4);
 	loader.RegisterFunction(http_post_multipart_scalar);
 

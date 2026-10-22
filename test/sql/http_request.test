@@ -245,3 +245,9 @@ SELECT h['content-type'] = h['Content-Type'] AND h['Content-Type'] = h['CONTENT-
 FROM (SELECT http_get('https://example.com/').headers as h);
 ----
 true
+
+# Connection failure surfaces as IO Error (scalar functions are fallible)
+statement error
+SELECT http_get('http://127.0.0.1:1/');
+----
+IO Error
