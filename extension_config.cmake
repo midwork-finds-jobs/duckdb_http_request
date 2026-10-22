@@ -9,5 +9,11 @@ duckdb_extension_load(http_request
 # Required extension for HTTP support - load from GitHub since it's out-of-tree now
 duckdb_extension_load(httpfs
     GIT_URL https://github.com/duckdb/duckdb-httpfs
-    GIT_TAG 7bd8c9c
+    GIT_TAG 77392a72077a85897db2519fae11e2c0da972b8a
 )
+
+# JSON is used by tests to parse echo server responses
+duckdb_extension_load(json)
+
+# Link into unittest/shell so tests can `require` them (DuckDB v2 no longer links by default)
+duckdb_extension_statically_link(http_request httpfs json)
